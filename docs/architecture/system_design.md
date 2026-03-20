@@ -87,7 +87,7 @@ Design priorities:
               |   384-dim, local)           |
               |         |                   |
               |         v                   |
-              |  Vector Store (ChromaDB)    |
+              |  Vector Store (in-memory)   |
               |  (top-k fraud patterns)     |
               |         |                   |
               |         v                   |
@@ -188,8 +188,8 @@ Design priorities:
 |                            | all-MiniLM-L6-v2          | (local)   | Falls back to ML-only.      |
 |                            | (384-dim, local)          |           |                             |
 +----------------------------+---------------------------+-----------+-----------------------------+
-| Vector Store               | ChromaDB (HNSW, m=32,     | ~10ms     | In-memory cache of top 500  |
-|                            | ef_search=100, cosine)    |           | patterns. Then ML-only.     |
+| Vector Store               | In-memory numpy cosine    | ~10ms     | In-memory cache of top 500  |
+|                            | similarity search         |           | patterns. Then ML-only.     |
 +----------------------------+---------------------------+-----------+-----------------------------+
 | RAG Retriever + Reranker   | Top-5 + ms-marco-MiniLM  | ~50ms     | Skip reranking. Use raw     |
 |                            | cross-encoder reranker    |           | retrieval results.          |
@@ -257,10 +257,10 @@ Design priorities:
 - Operates in micro-batches for throughput. On failure, reverts to ML-score-only decision.
 - Writes each embedding to the sample buffer for async drift monitoring.
 
-### Vector Store (ChromaDB)
+### Vector Store (In-Memory)
 
 - Two collections: fraud knowledge base (curated patterns, updated monthly) and reference embeddings (50K+ snapshots, refreshed quarterly on 90-day rolling window).
-- HNSW indexing (m=32, ef_construction=200, ef_search=100), cosine distance similarity.
+- In-memory numpy cosine similarity search.
 
 ### RAG Retriever and Reranker
 
@@ -351,7 +351,7 @@ Design priorities:
      +--> Sample Buffer (for drift monitoring)
      |
      v
-[10] Vector Store / ChromaDB (top-5 patterns, ~10ms)
+[10] Vector Store / in-memory cosine search (top-5 patterns, ~10ms)
      |
      v
 [11] Cross-Encoder Reranker (~50ms)
@@ -392,7 +392,7 @@ Design priorities:
 +----------------------------+-------------------+---------------------------------------------+
 | Embedding Service          | 1,000 TPS         | Local model inference. Only 20-30% of traffic.|
 +----------------------------+-------------------+---------------------------------------------+
-| RAG Retrieval (ChromaDB)   | 3,000 QPS         | HNSW index lookup. In-memory.               |
+| RAG Retrieval (in-memory)  | 3,000 QPS         | Numpy cosine similarity. In-memory.         |
 +----------------------------+-------------------+---------------------------------------------+
 | LLM Assessor               | 150 TPS           | Local LLM inference. Async investigation    |
 | (Ollama phi3:mini, async)  |                   | path only. Does not constrain authorization.|
@@ -412,7 +412,7 @@ The LLM assessor is the most expensive component per-transaction, but it operate
 - The ML scorer handles all transactions at high speed within the sub-50ms authorization SLA. Authorization decisions are made entirely by the ML model and decision router.
 - Ingestion gateway, feature extraction, ML scorer, and decision router are stateless and horizontally scalable.
 - The RAG+LLM investigation pipeline operates asynchronously and only processes flagged transactions, decoupling investigation throughput from authorization throughput.
-- ChromaDB supports sharding. The fraud knowledge base (tens of thousands of patterns) does not require it. Reference embedding collection (50K+) benefits from in-memory indexing.
+- The in-memory vector store holds the fraud knowledge base (tens of thousands of patterns) and the reference embedding collection (50K+) directly in memory for fast cosine similarity search.
 - Both drift monitors are singleton services. Leader election ensures standby takeover if primary fails.
 
 ---
@@ -455,7 +455,7 @@ The LLM assessor is the most expensive component per-transaction, but it operate
 
 - Critical authorization path (ingestion, feature extraction, ML scoring, routing) is fully isolated from the async RAG+LLM investigation pipeline and monitoring plane.
 - Failure in RAG+LLM investigation, drift monitors, LangSmith, or alert router does not affect real-time authorization decisions.
-- Circuit breakers at each external dependency boundary (embedding API, LLM API, ChromaDB, LangSmith).
+- Circuit breakers at each external dependency boundary (embedding API, LLM API, vector store, LangSmith).
 - ML scorer has no external API dependencies at inference time (model loaded locally).
 
 ---

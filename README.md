@@ -294,7 +294,7 @@ pytest tests/ -v
 | ML Scoring | XGBoost, scikit-learn | Primary fraud scoring (sub-10ms, real-time authorization). |
 | Embeddings | sentence-transformers (all-MiniLM-L6-v2) | Transaction text to 384-dim vectors for RAG layer. Local, no API key. |
 | LLM Inference | Ollama (phi3:mini) | Async post-transaction investigation for flagged transactions. Local, no API key. |
-| Vector Database | ChromaDB | Storage and retrieval of transaction embeddings. |
+| Vector Search | In-memory numpy vector search | Storage and retrieval of transaction embeddings via cosine similarity. |
 | Drift Detection | MMD (custom implementation) | Sole embedding drift metric. Pooled RBF kernel, permutation test. |
 | Drift Reporting | Evidently AI | Periodic HTML drift reports with PCA-projected embedding analysis. |
 | LLM Observability | LangSmith | Async investigation pipeline tracing, custom feedback scores, dashboards. |

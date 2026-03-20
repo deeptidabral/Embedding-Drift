@@ -69,14 +69,9 @@ embedding:
 # ---------------------------------------------------------------------------
 
 vector_store:
-  backend: "chromadb"
+  backend: "in_memory"
   collection_name: "fraud_knowledge_base"
   distance_metric: "cosine"
-  index_type: "hnsw"
-  hnsw_config:
-    m: 32
-    ef_construction: 200
-    ef_search: 100
 
 # ---------------------------------------------------------------------------
 # Retrieval settings (async post-transaction investigation layer)

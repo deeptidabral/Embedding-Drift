@@ -67,6 +67,6 @@ reference:
     by_transaction_amount_band: true
     by_geography: true
   storage:
-    backend: "chromadb"
+    backend: "in_memory"
     collection_prefix: "ref_embeddings"
     versioning: true

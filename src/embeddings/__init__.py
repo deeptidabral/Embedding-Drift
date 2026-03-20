@@ -5,7 +5,7 @@ This module provides the ``LocalEmbeddingGenerator`` (aliased as
 ``TransactionEmbeddingGenerator``) for turning raw transaction
 dictionaries into dense vector representations via sentence-transformers
 (all-MiniLM-L6-v2), and the ``EmbeddingStore`` for persisting and
-querying those vectors with ChromaDB.
+querying those vectors with an in-memory vector store.
 """
 
 from src.embeddings.generator import (

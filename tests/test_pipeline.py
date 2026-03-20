@@ -7,7 +7,7 @@ analysis_tier fields), as well as dual-layer pipeline behaviour:
   - ML-only path when the ML score is clearly low or high risk.
   - ML+LLM path for gray zone scores (0.3--0.7) or high-value txns.
   - Fallback on critical embedding drift.
-External services (ChromaDB, LangSmith) are mocked throughout.
+External services (LangSmith) are mocked throughout.
 """
 
 from __future__ import annotations

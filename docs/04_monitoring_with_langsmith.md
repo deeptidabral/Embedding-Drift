@@ -145,11 +145,10 @@ def generate_embedding(text: str):
 
 @traceable(name="retrieve-fraud-patterns", run_type="retriever")
 def retrieve_fraud_patterns(embedding, top_k: int = 5):
-    """Query ChromaDB for historically similar fraud patterns."""
-    import chromadb
-    chroma_client = chromadb.HttpClient()
-    collection = chroma_client.get_collection("fraud_knowledge_base")
-    results = collection.query(query_embeddings=[embedding], n_results=top_k)
+    """Query the vector store for historically similar fraud patterns."""
+    from src.embeddings.store import EmbeddingStore
+    store = EmbeddingStore()
+    results = store.query_similar(query_embedding=embedding, top_k=top_k)
     return results
 ```
 

@@ -396,7 +396,7 @@ def llm_assess_fraud(
 ) -> dict[str, Any]:
     """Simulate a RAG+LLM fraud assessment.
 
-    In production, this retrieves similar fraud patterns from ChromaDB
+    In production, this retrieves similar fraud patterns from the vector store
     and sends the transaction context to Ollama phi3:mini for structured analysis.
     """
     amount = txn["amount"]

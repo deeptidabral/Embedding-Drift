@@ -105,7 +105,7 @@ class FraudPatternRetriever:
             Number of results to return.  When a reranker is configured,
             this controls the final count after reranking.
         where:
-            Optional ChromaDB metadata filter.
+            Optional metadata filter for the vector store.
         query_id:
             Identifier for this retrieval (used in metrics tracking).
 
@@ -174,7 +174,7 @@ class FraudPatternRetriever:
         """Convert raw query results to ``FraudPattern`` objects."""
         patterns: list[FraudPattern] = []
         for r in results:
-            # ChromaDB cosine distance is in [0, 2]; convert to similarity.
+            # Cosine distance is in [0, 2]; convert to similarity.
             similarity = max(0.0, 1.0 - r.distance)
             patterns.append(
                 FraudPattern(
