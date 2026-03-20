@@ -1,0 +1,85 @@
+# Monitoring Configuration
+# Defines how drift metrics are reported to LangSmith and alerting systems
+
+langsmith:
+  project_name: "fraud-detection-embedding-drift"
+  tracing_enabled: true
+  feedback_enabled: true
+  tags:
+    - "embedding-drift"
+    - "fraud-detection"
+    - "production-monitoring"
+
+  # Custom evaluation metrics reported to LangSmith
+  custom_metrics:
+    - name: "embedding_cosine_drift"
+      description: "Cosine distance drift from reference distribution"
+      metric_type: "continuous"
+      higher_is_worse: true
+
+    - name: "embedding_mmd_drift"
+      description: "Maximum Mean Discrepancy drift score"
+      metric_type: "continuous"
+      higher_is_worse: true
+
+    - name: "retrieval_relevance_degradation"
+      description: "Drop in RAG retrieval relevance score correlated with drift"
+      metric_type: "continuous"
+      higher_is_worse: true
+
+    - name: "fraud_detection_precision_shift"
+      description: "Change in fraud detection precision relative to baseline"
+      metric_type: "continuous"
+      higher_is_worse: false
+
+  # Dashboard panels
+  dashboard:
+    refresh_interval_seconds: 60
+    panels:
+      - title: "Embedding Drift Over Time"
+        metric: "embedding_cosine_drift"
+        chart_type: "time_series"
+        threshold_lines: [0.05, 0.15, 0.30]
+
+      - title: "MMD Two-Sample Test"
+        metric: "embedding_mmd_drift"
+        chart_type: "time_series"
+        threshold_lines: [0.02, 0.08, 0.20]
+
+      - title: "Retrieval Quality vs Drift Correlation"
+        metrics: ["embedding_cosine_drift", "retrieval_relevance_degradation"]
+        chart_type: "scatter"
+
+      - title: "Drift by Merchant Category"
+        metric: "embedding_cosine_drift"
+        chart_type: "heatmap"
+        group_by: "merchant_category_code"
+
+alerting:
+  channels:
+    slack:
+      webhook_env_var: "SLACK_DRIFT_WEBHOOK_URL"
+      channel: "#fraud-model-alerts"
+      mention_on_critical: "@oncall-ml-engineer"
+
+    pagerduty:
+      routing_key_env_var: "PAGERDUTY_ROUTING_KEY"
+      severity_mapping:
+        warning: "warning"
+        critical: "critical"
+
+  # Deduplication to prevent alert fatigue
+  deduplication:
+    window_minutes: 30
+    max_alerts_per_window: 3
+
+logging:
+  level: "INFO"
+  format: "json"
+  output: "stdout"
+  structured_fields:
+    - "drift_metric"
+    - "drift_value"
+    - "severity"
+    - "window_size"
+    - "timestamp"

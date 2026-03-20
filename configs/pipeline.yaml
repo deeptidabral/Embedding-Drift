@@ -1,0 +1,130 @@
+# Fraud Detection Pipeline Configuration
+# Dual-layer fraud detection: ML model primary scoring with RAG+LLM complementary analysis
+
+pipeline:
+  name: "fraud-detection-dual-layer"
+  version: "2.0.0"
+  description: "Dual-layer fraud detection: ML model primary scoring with RAG+LLM complementary analysis"
+
+# ---------------------------------------------------------------------------
+# Primary scorer -- gradient boosted trees (XGBoost)
+# ---------------------------------------------------------------------------
+
+ml_model:
+  model_type: "xgboost"
+  model_path: "models/fraud_xgb_v2.json"
+  feature_columns:
+    - amount
+    - merchant_category_code
+    - channel
+    - is_recurring
+    - hour_of_day
+    - day_of_week
+    - days_since_last_txn
+    - avg_amount_30d
+    - txn_count_30d
+    - amount_deviation_ratio
+    - is_new_merchant
+    - is_high_risk_country
+  use_simulated_scorer: false  # set to true for demo / integration tests
+
+# ---------------------------------------------------------------------------
+# Decision routing -- determines when the complementary RAG+LLM layer fires
+# ---------------------------------------------------------------------------
+
+decision_routing:
+  gray_zone_lower: 0.3
+  gray_zone_upper: 0.7
+  high_value_threshold: 10000.0
+  always_llm_for_new_merchants: false
+  ml_weight: 0.6  # weight of ML score in blended ML+LLM score (LLM weight = 1 - ml_weight)
+
+# ---------------------------------------------------------------------------
+# Embedding layer (used by RAG retrieval and drift monitoring)
+# ---------------------------------------------------------------------------
+
+embedding:
+  model: "all-MiniLM-L6-v2"
+  dimensions: 384
+  backend: "sentence-transformers"  # Alternative: "openai" (requires OPENAI_API_KEY)
+  batch_size: 128
+  max_retries: 3
+  timeout_seconds: 30
+
+  # Transaction text template used before embedding
+  transaction_template: |
+    Transaction ID: {transaction_id}
+    Amount: {amount} {currency}
+    Merchant: {merchant_name}
+    MCC: {merchant_category_code}
+    Cardholder Location: {cardholder_location}
+    Merchant Location: {merchant_location}
+    Time: {timestamp}
+    Channel: {channel}
+    Device Fingerprint: {device_fingerprint}
+    Historical Pattern: {historical_summary}
+
+# ---------------------------------------------------------------------------
+# Vector store (knowledge base for RAG retrieval)
+# ---------------------------------------------------------------------------
+
+vector_store:
+  backend: "chromadb"
+  collection_name: "fraud_knowledge_base"
+  distance_metric: "cosine"
+  index_type: "hnsw"
+  hnsw_config:
+    m: 32
+    ef_construction: 200
+    ef_search: 100
+
+# ---------------------------------------------------------------------------
+# Retrieval settings (complementary layer -- invoked selectively)
+# ---------------------------------------------------------------------------
+
+retrieval:
+  top_k: 5
+  similarity_threshold: 0.75
+  reranking_enabled: true
+  reranking_model: "cross-encoder/ms-marco-MiniLM-L-12-v2"
+
+# ---------------------------------------------------------------------------
+# LLM settings (complementary layer -- invoked selectively)
+# ---------------------------------------------------------------------------
+
+llm:
+  model: "gpt-4o"
+  temperature: 0.0
+  max_tokens: 1024
+  system_prompt: |
+    You are a fraud detection analyst providing complementary analysis to a
+    primary ML scoring model at a major payment processor.  The ML model has
+    already produced a fraud probability score for this transaction.  Your
+    role is to:
+      1. Provide explainability -- generate a clear, human-readable rationale
+         for why the transaction is suspicious or legitimate.
+      2. Identify novel patterns -- surface historical fraud patterns that
+         the ML model may not have captured in its feature set.
+      3. Support audit trails -- produce structured reasoning suitable for
+         regulatory compliance documentation.
+    Analyze the provided transaction against historical fraud patterns
+    retrieved from the knowledge base and produce a structured risk
+    assessment that complements the ML model output.
+
+  response_schema:
+    fraud_probability: "float between 0.0 and 1.0"
+    risk_level: "one of: low, medium, high, critical"
+    reasoning: "string explaining the assessment"
+    matching_patterns: "list of matched historical fraud patterns"
+    novel_indicators: "list of risk signals not captured by ML features"
+    recommended_action: "one of: approve, flag_for_review, decline, block_card"
+
+# ---------------------------------------------------------------------------
+# Processing
+# ---------------------------------------------------------------------------
+
+processing:
+  max_concurrent_transactions: 100
+  timeout_per_transaction_ms: 2000
+  fallback_on_timeout: "rule_based_engine"
+  fallback_on_drift_critical: "rule_based_engine"

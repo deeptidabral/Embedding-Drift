@@ -1,0 +1,101 @@
+# Embedding Drift Threshold Configuration
+# Context: Real-time fraud detection pipeline for payment processors
+#
+# These thresholds are calibrated for transaction embedding spaces where
+# the reference distribution represents known legitimate and fraudulent
+# transaction patterns. Values are derived from empirical analysis of
+# payment transaction embeddings across quarterly model refresh cycles.
+
+drift_detection:
+  # Statistical distance thresholds
+  # Each metric has three severity bands: nominal, warning, critical
+  metrics:
+    cosine_distance:
+      description: "Mean pairwise cosine distance between reference and production embedding centroids"
+      nominal_upper: 0.05
+      warning_upper: 0.15
+      critical_upper: 0.30
+      window_size: 1000
+      evaluation_frequency_seconds: 300
+
+    maximum_mean_discrepancy:
+      description: "Kernel-based two-sample test statistic (MMD) with RBF kernel"
+      nominal_upper: 0.02
+      warning_upper: 0.08
+      critical_upper: 0.20
+      kernel: "rbf"
+      kernel_bandwidth: "median_heuristic"
+      window_size: 2000
+      evaluation_frequency_seconds: 600
+
+    kolmogorov_smirnov:
+      description: "KS statistic applied per principal component of the embedding space"
+      nominal_upper: 0.05
+      warning_upper: 0.12
+      critical_upper: 0.25
+      num_principal_components: 10
+      p_value_threshold: 0.01
+      window_size: 1500
+      evaluation_frequency_seconds: 300
+
+    wasserstein_distance:
+      description: "Earth Mover Distance between reference and production embedding distributions"
+      nominal_upper: 0.03
+      warning_upper: 0.10
+      critical_upper: 0.22
+      window_size: 2000
+      evaluation_frequency_seconds: 600
+
+    population_stability_index:
+      description: "PSI computed over binned embedding principal components"
+      nominal_upper: 0.10
+      warning_upper: 0.20
+      critical_upper: 0.35
+      num_bins: 20
+      window_size: 5000
+      evaluation_frequency_seconds: 900
+
+  # Ensemble decision logic
+  # Drift is declared at a given severity if at least min_metrics_agreeing
+  # metrics independently reach that severity level within the same window.
+  ensemble:
+    min_metrics_agreeing: 2
+    lookback_windows: [1000, 5000, 20000]
+    require_sustained_periods: 3
+
+# Automated response actions keyed by severity
+actions:
+  nominal:
+    - log_metrics
+    - update_dashboard
+
+  warning:
+    - log_metrics
+    - update_dashboard
+    - notify_oncall_slack
+    - increase_monitoring_frequency
+    - trigger_embedding_quality_audit
+    - flag_recent_transactions_for_manual_review
+
+  critical:
+    - log_metrics
+    - update_dashboard
+    - page_oncall_engineer
+    - activate_fallback_model
+    - halt_automated_approvals
+    - trigger_emergency_retraining_pipeline
+    - snapshot_production_embeddings_for_forensics
+
+# Reference distribution management
+reference:
+  refresh_strategy: "rolling"
+  rolling_window_days: 90
+  minimum_samples: 50000
+  stratification:
+    by_merchant_category: true
+    by_transaction_amount_band: true
+    by_geography: true
+  storage:
+    backend: "chromadb"
+    collection_prefix: "ref_embeddings"
+    versioning: true

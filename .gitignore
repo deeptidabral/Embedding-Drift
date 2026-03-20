@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+.Python
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment and secrets
+.env
+.env.local
+.env.production
+credentials.json
+*.pem
+*.key
+
+# Data artifacts
+data/raw/
+data/processed/
+*.parquet
+*.csv
+!examples/data/*.csv
+
+# Model artifacts
+models/
+*.pt
+*.onnx
+*.pkl
+
+# Monitoring artifacts
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.claude/
+reports/evidently/
+reports/*.npy
