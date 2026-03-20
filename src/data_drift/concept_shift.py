@@ -13,7 +13,7 @@ from typing import Any
 
 import numpy as np
 from pydantic import BaseModel, Field
-from scipy.stats import chi2_contingency, ks_2samp
+from scipy.stats import ks_2samp
 
 logger = logging.getLogger(__name__)
 
@@ -123,31 +123,21 @@ class ConceptShiftDetector:
             np.mean(np.abs(self._ref_calibration - prod_calibration))
         )
 
-        # 3. Label distribution chi-squared test
-        ref_counts = np.array([
-            np.sum(self._ref_labels == 0),
-            np.sum(self._ref_labels == 1),
-        ])
-        prod_counts = np.array([
-            np.sum(prod_labels == 0),
-            np.sum(prod_labels == 1),
-        ])
-        contingency = np.array([ref_counts, prod_counts])
-
-        if contingency.min() == 0:
-            chi2_stat, chi2_p = 0.0, 1.0
-        else:
-            chi2_stat, chi2_p, _, _ = chi2_contingency(contingency)
-
-        is_drift = ks_p < self._alpha or chi2_p < self._alpha
+        # Drift decision based ONLY on P(Y|X) signals (conditional
+        # confidence shift and calibration shift).  Raw label distribution
+        # change is Target Shift (P(Y)), not Concept Shift (P(Y|X)), and
+        # is already handled by TargetShiftDetector.  Including it here
+        # would cause false alarms when fraud volume changes without any
+        # change in the model's decision boundary.
+        is_drift = ks_p < self._alpha or calibration_shift > 0.10
 
         return ConceptShiftResult(
             is_drift=is_drift,
             confidence_ks_statistic=float(ks_stat),
             confidence_ks_p_value=float(ks_p),
             calibration_shift=calibration_shift,
-            label_distribution_chi2=float(chi2_stat),
-            label_distribution_p_value=float(chi2_p),
+            label_distribution_chi2=0.0,
+            label_distribution_p_value=1.0,
             details={
                 "ref_fraud_rate": float(self._ref_labels.mean()),
                 "prod_fraud_rate": float(prod_labels.mean()),
@@ -168,7 +158,13 @@ class ConceptShiftDetector:
         calibration = np.zeros(self._n_bins, dtype=np.float64)
 
         for i in range(self._n_bins):
-            mask = (predictions >= bin_edges[i]) & (predictions < bin_edges[i + 1])
+            if i == self._n_bins - 1:
+                # Final bin is inclusive of 1.0. Tree-based models can
+                # output exact 1.0 from pure positive leaf nodes, and a
+                # strict less-than would silently drop those predictions.
+                mask = (predictions >= bin_edges[i]) & (predictions <= bin_edges[i + 1])
+            else:
+                mask = (predictions >= bin_edges[i]) & (predictions < bin_edges[i + 1])
             if mask.sum() > 0:
                 calibration[i] = labels[mask].mean()
             else:

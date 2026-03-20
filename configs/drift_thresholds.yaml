@@ -19,9 +19,11 @@ drift_detection:
   metrics:
     maximum_mean_discrepancy:
       description: "Kernel-based two-sample test statistic (MMD) with RBF kernel"
-      nominal_upper: 0.02
-      warning_upper: 0.08
-      critical_upper: 0.20
+      # Calibrated for 384-dim sentence-transformer embeddings (unit-normalized).
+      # These produce smaller MMD values than higher-dim models.
+      nominal_upper: 0.005
+      warning_upper: 0.02
+      critical_upper: 0.05
       kernel: "rbf"
       kernel_bandwidth: "median_heuristic"
       window_size: 2000

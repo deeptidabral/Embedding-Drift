@@ -97,7 +97,7 @@ class EmbeddingDriftDetector:
 
     _BUILT_IN_THRESHOLDS: dict[str, MetricThresholds] = {
         "mmd": MetricThresholds(
-            low=0.005, moderate=0.02, high=0.05, critical=0.10
+            low=0.005, moderate=0.02, high=0.035, critical=0.05
         ),
     }
 

@@ -630,7 +630,9 @@ def main() -> None:
     sample_df = pd.concat([fraud_sample, high_amt, legit_sample]).head(n_transactions).reset_index(drop=True)
 
     from src.data.loader import SparkovDataLoader
+    from src.embeddings.generator import LocalEmbeddingGenerator
     loader = SparkovDataLoader()
+    gen = LocalEmbeddingGenerator()
 
     for i, (_, row) in enumerate(sample_df.iterrows()):
         row_dict = row.to_dict()
@@ -705,16 +707,187 @@ def main() -> None:
     print(f"  Auth decisions: {approved} approved, {declined} declined, {flagged_review} flagged for review")
     print()
 
-    # Step 7
-    drift_results = run_drift_detection(ref_embeddings, prod_embeddings)
+    # Step 7a: Baseline drift (adjacent months, expect no drift)
+    print("=" * 72)
+    print("STEP 7A: BASELINE DRIFT (adjacent months, expect no significant drift)")
+    print("=" * 72)
+    baseline_drift = run_drift_detection(ref_embeddings, prod_embeddings)
 
-    # Step 8
-    ref_df = df[df["timestamp"] < "2019-04-01"]
-    prod_df_full = df[(df["timestamp"] >= "2019-04-01") & (df["timestamp"] < "2019-07-01")]
-    run_evidently_reports(ref_embeddings, prod_embeddings, ref_df, prod_df_full)
+    # Step 7b: Category shift scenario (CRITICAL drift)
+    # This simulates a real-world event: fraud campaign shifts from
+    # in-store channels (grocery, gas, dining) to online channels
+    # (shopping_net, misc_net). The knowledge base was built from
+    # in-store transactions, so retrieval degrades for online queries.
+    print("=" * 72)
+    print("STEP 7B: CATEGORY SHIFT SCENARIO (expect CRITICAL drift)")
+    print("=" * 72)
+    print()
+    print("  Scenario: A fraud campaign shifts from in-store to online channels.")
+    print("  Reference = grocery/gas/dining transactions.")
+    print("  Production = shopping_net/misc_net/shopping_pos transactions.")
+    print("  The knowledge base has no relevant online patterns to retrieve.")
+    print()
 
-    # Step 9
-    generate_visualizations(results, drift_results)
+    ref_cats = ["grocery_pos", "gas_transport", "food_dining"]
+    prod_cats = ["shopping_net", "misc_net", "shopping_pos"]
+
+    ref_shift_df = df[df["category"].isin(ref_cats)].sample(1000, random_state=42)
+    prod_shift_df = df[df["category"].isin(prod_cats)].sample(1000, random_state=99)
+
+    ref_shift_texts = [loader.to_transaction_text(row) for _, row in ref_shift_df.iterrows()]
+    prod_shift_texts = [loader.to_transaction_text(row) for _, row in prod_shift_df.iterrows()]
+
+    ref_shift_emb = gen.encode_texts(ref_shift_texts)
+    prod_shift_emb = gen.encode_texts(prod_shift_texts)
+
+    category_drift = run_drift_detection(ref_shift_emb, prod_shift_emb)
+
+    # Use category shift results as the primary drift signal for reports
+    drift_results = category_drift
+
+    # Step 8: Evidently reports (run on category shift data for meaningful results)
+    print("=" * 72)
+    print("STEP 8: EVIDENTLY AI DRIFT REPORTS (category shift scenario)")
+    print("=" * 72)
+
+    from src.monitoring.evidently_reporter import EvidentlyDriftReporter
+    ev_reporter = EvidentlyDriftReporter(reports_dir="reports/evidently", embedding_dim=384)
+
+    emb_summary = ev_reporter.generate_embedding_drift_report(
+        ref_shift_emb, prod_shift_emb,
+        save_html=True, report_name="category_shift_embedding_drift",
+    )
+    print(f"  Embedding drift detected: {emb_summary.embedding_drift_detected}")
+    print(f"  Drift score: {emb_summary.embedding_drift_score:.4f}")
+    print(f"  HTML: {emb_summary.html_report_path}")
+
+    feature_cols = ["amt", "hour_of_day", "day_of_week", "city_pop"]
+    avail = [c for c in feature_cols if c in ref_shift_df.columns]
+    if avail:
+        feat_summary = ev_reporter.generate_feature_drift_report(
+            ref_shift_df[avail], prod_shift_df[avail],
+            numerical_features=avail, save_html=True,
+            report_name="category_shift_feature_drift",
+        )
+        print(f"  Feature drift detected: {feat_summary.overall_drift_detected}")
+
+    # Post category shift drift to LangSmith
+    api_key = os.environ.get("LANGCHAIN_API_KEY", "")
+    if api_key:
+        try:
+            from langsmith import Client
+            ls_client = Client()
+            project_name = os.environ.get("LANGCHAIN_PROJECT", "fraud-detection-embedding-drift")
+            runs = list(ls_client.list_runs(project_name=project_name, execution_order=1, limit=3))
+            if runs:
+                severity_map = {"none": 0.0, "low": 0.25, "moderate": 0.5, "high": 0.75, "critical": 1.0}
+                ls_client.create_feedback(
+                    run_id=runs[0].id,
+                    key="drift_mmd_category_shift",
+                    score=float(category_drift["mmd"]["value"]),
+                    comment=f"CATEGORY SHIFT: severity={category_drift['severity']}. "
+                            f"In-store vs online channels. p={category_drift['mmd']['p_value']:.4f}.",
+                )
+                ls_client.create_feedback(
+                    run_id=runs[0].id,
+                    key="drift_severity_category_shift",
+                    score=severity_map.get(category_drift["severity"], 0.0),
+                    comment=f"CRITICAL: Category shift detected. Actions: {'; '.join(category_drift['recommended_actions'])}",
+                )
+                print(f"  Posted category shift drift to LangSmith run {runs[0].id}")
+        except Exception as e:
+            print(f"  Failed to post category shift drift: {e}")
+
+    print()
+
+    # Step 9: Visualizations (include both baseline and category shift)
+    print("=" * 72)
+    print("STEP 9: GENERATING VISUALIZATIONS")
+    print("=" * 72)
+
+    os.makedirs("reports/visualizations", exist_ok=True)
+    sns.set_style("whitegrid")
+    df_results = pd.DataFrame(results)
+
+    # Chart 1: 3-panel summary
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle("Dual-Layer Fraud Detection Pipeline Results", fontsize=14, fontweight="bold")
+
+    tier_counts = df_results["analysis_tier"].value_counts()
+    colors_pie = ["#4CAF50" if "ml_only" in t else "#FF9800" for t in tier_counts.index]
+    axes[0].pie(tier_counts.values, labels=[t.replace("_", " ") for t in tier_counts.index],
+                autopct="%1.0f%%", colors=colors_pie)
+    axes[0].set_title("Analysis Tier Breakdown")
+
+    for label, color in [(0, "#4CAF50"), (1, "#D32F2F")]:
+        subset = df_results[df_results["is_fraud_actual"] == label]["ml_score"]
+        if len(subset) > 0:
+            axes[1].hist(subset, bins=20, alpha=0.6, color=color,
+                         label=f"{'Fraud' if label else 'Legit'} (n={len(subset)})", density=True)
+    axes[1].axvline(0.3, color="orange", linestyle="--", label="Gray zone")
+    axes[1].axvline(0.7, color="orange", linestyle="--")
+    axes[1].set_xlabel("ML Score")
+    axes[1].set_title("ML Score Distribution")
+    axes[1].legend(fontsize=8)
+
+    scenario_names = ["Baseline\n(adjacent months)", "Category Shift\n(in-store vs online)"]
+    mmd_values = [baseline_drift["mmd"]["value"], category_drift["mmd"]["value"]]
+    bar_colors = ["#4CAF50", "#D32F2F"]
+    axes[2].bar(scenario_names, mmd_values, color=bar_colors, edgecolor="black", linewidth=0.5)
+    axes[2].axhline(y=0.02, color="orange", linestyle="--", alpha=0.7, label="Warning (0.02)")
+    axes[2].axhline(y=0.08, color="red", linestyle="--", alpha=0.7, label="Critical (0.08)")
+    axes[2].set_ylabel("MMD Value")
+    axes[2].set_title("MMD Drift: Baseline vs Category Shift")
+    axes[2].legend(fontsize=8)
+    for i, (v, sev) in enumerate(zip(mmd_values, [baseline_drift["severity"], category_drift["severity"]])):
+        axes[2].text(i, v + 0.001, sev.upper(), ha="center", fontweight="bold", fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig("reports/visualizations/15_live_pipeline_summary.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print("  Saved: reports/visualizations/15_live_pipeline_summary.png")
+
+    # Chart 2: LLM investigation details
+    flagged_df = df_results[df_results["analysis_tier"] == "ml_flagged_async_llm_investigation"]
+    if len(flagged_df) > 0 and "llm_investigation" in flagged_df.columns:
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        llm_risks = [r["llm_risk"] for r in flagged_df["llm_investigation"] if r is not None]
+        llm_actions = [r["llm_action"] for r in flagged_df["llm_investigation"] if r is not None]
+        if llm_risks:
+            risk_series = pd.Series(llm_risks).value_counts()
+            axes[0].bar(risk_series.index, risk_series.values, color="#2196F3")
+            axes[0].set_title(f"LLM Risk Assessments (n={len(llm_risks)}, async investigation)")
+            axes[0].set_ylabel("Count")
+        if llm_actions:
+            action_series = pd.Series(llm_actions).value_counts()
+            axes[1].bar(action_series.index, action_series.values, color="#FF5722")
+            axes[1].set_title("LLM Recommended Actions (async investigation)")
+            axes[1].set_ylabel("Count")
+        plt.tight_layout()
+        plt.savefig("reports/visualizations/16_llm_investigations.png", dpi=150, bbox_inches="tight")
+        plt.close()
+        print("  Saved: reports/visualizations/16_llm_investigations.png")
+
+    # Chart 3: Category shift t-SNE
+    from sklearn.manifold import TSNE
+    combined_emb = np.vstack([ref_shift_emb[:300], prod_shift_emb[:300]])
+    tsne_labels = ["In-store (Reference)"] * 300 + ["Online (Production)"] * 300
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42)
+    proj = tsne.fit_transform(combined_emb)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    for label, color in [("In-store (Reference)", "#2196F3"), ("Online (Production)", "#D32F2F")]:
+        mask = [l == label for l in tsne_labels]
+        ax.scatter(proj[mask, 0], proj[mask, 1], c=color, alpha=0.5, s=20, label=label)
+    ax.set_title("t-SNE: Category Shift Embedding Drift (CRITICAL)", fontsize=14, fontweight="bold")
+    ax.set_xlabel("t-SNE 1")
+    ax.set_ylabel("t-SNE 2")
+    ax.legend(fontsize=12)
+    plt.tight_layout()
+    plt.savefig("reports/visualizations/17_category_shift_tsne.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print("  Saved: reports/visualizations/17_category_shift_tsne.png")
+
+    print()
 
     # Final summary
     elapsed = time.time() - start_time
@@ -725,18 +898,17 @@ def main() -> None:
     print(f"  Transactions processed: {len(results)}")
     print(f"  ML-only: {ml_only}, Flagged (async LLM): {flagged}")
     print(f"  Auth: {approved} approved, {declined} declined, {flagged_review} flagged")
-    print(f"  Drift (MMD) severity: {drift_results['severity']}")
     print()
-    print("  Architecture:")
-    print("    ML model  -> synchronous authorization (approve / decline / flag)")
-    print("    LLM/RAG   -> async post-transaction investigation (flagged txns only)")
-    print("    Drift      -> MMD-based monitoring (sole metric)")
+    print("  Drift results:")
+    print(f"    Baseline (adjacent months): MMD={baseline_drift['mmd']['value']:.6f}, severity={baseline_drift['severity']}")
+    print(f"    Category shift (in-store vs online): MMD={category_drift['mmd']['value']:.6f}, severity={category_drift['severity']}")
     print()
     print("  Outputs:")
     print("    reports/visualizations/15_live_pipeline_summary.png")
     print("    reports/visualizations/16_llm_investigations.png")
-    print("    reports/evidently/live_embedding_drift.html")
-    print("    reports/evidently/live_feature_drift.html")
+    print("    reports/visualizations/17_category_shift_tsne.png")
+    print("    reports/evidently/category_shift_embedding_drift.html")
+    print("    reports/evidently/category_shift_feature_drift.html")
     print()
     print("  LangSmith dashboard:")
     print("    https://smith.langchain.com (project: fraud-detection-embedding-drift)")
