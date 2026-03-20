@@ -375,9 +375,11 @@ class OpenAIEmbeddingGenerator:
     def _call_api_with_retry(self, texts: list[str]) -> Any:
         """Call the OpenAI embeddings endpoint with exponential back-off.
 
-        Retries on ``RateLimitError`` and generic ``APIError`` up to
-        ``self._max_retries`` times.  Non-retryable exceptions propagate
-        immediately.
+        WARNING: This method uses ``time.sleep()`` for retry backoff,
+        which is a blocking synchronous call. If this code runs inside
+        an async event loop (asyncio, FastAPI, Celery), use the
+        ``AsyncOpenAI`` client with ``await asyncio.sleep()`` instead.
+        This synchronous version is intended for batch/offline pipelines.
         """
         backoff = INITIAL_BACKOFF_SECONDS
         last_exception: Exception | None = None
@@ -392,7 +394,7 @@ class OpenAIEmbeddingGenerator:
             except RateLimitError as exc:
                 last_exception = exc
                 logger.warning(
-                    "Rate-limited on attempt %d/%d -- backing off %.1fs",
+                    "Rate-limited on attempt %d/%d. Backing off %.1fs.",
                     attempt,
                     self._max_retries,
                     backoff,

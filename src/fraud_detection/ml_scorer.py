@@ -9,7 +9,7 @@ included for demo and testing purposes.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,29 +25,22 @@ logger = logging.getLogger(__name__)
 # Feature schema
 # ---------------------------------------------------------------------------
 
-FEATURE_COLUMNS: list[str] = [
-    "amount",
-    "merchant_category_code",
-    "channel",
-    "is_recurring",
-    "hour_of_day",
-    "day_of_week",
-    "days_since_last_txn",
-    "avg_amount_30d",
-    "txn_count_30d",
-    "amount_deviation_ratio",
-    "is_new_merchant",
-    "is_high_risk_country",
-]
+FEATURE_COLUMNS: list[str] = (
+    ["amount", "is_recurring", "hour_of_day", "day_of_week",
+     "days_since_last_txn", "avg_amount_30d", "txn_count_30d",
+     "amount_deviation_ratio", "is_new_merchant", "is_high_risk_country"]
+    + [f"mcc_{mcc}" for mcc in ["5411", "5812", "5912", "5999", "7995",
+                                  "4829", "6011", "5944", "5732", "5691"]]
+    + [f"channel_{ch}" for ch in ["online", "in_store", "atm", "mobile", "phone"]]
+)
 
-# Categorical encoding maps -- kept simple for portability.
-_MCC_ENCODING: dict[str, int] = {
-    "5411": 0, "5812": 1, "5912": 2, "5999": 3, "7995": 4,
-    "4829": 5, "6011": 6, "5944": 7, "5732": 8, "5691": 9,
-}
-_CHANNEL_ENCODING: dict[str, int] = {
-    "online": 0, "in_store": 1, "atm": 2, "mobile": 3, "phone": 4,
-}
+# Known categorical values for one-hot encoding.
+# Unknown values get all-zero encoding (no false ordinality imposed).
+_KNOWN_MCCS: list[str] = [
+    "5411", "5812", "5912", "5999", "7995",
+    "4829", "6011", "5944", "5732", "5691",
+]
+_KNOWN_CHANNELS: list[str] = ["online", "in_store", "atm", "mobile", "phone"]
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +61,7 @@ class MLScoringResult(BaseModel):
         description="Human-readable names of the top contributing risk factors.",
     )
     scored_at: str = Field(
-        default_factory=lambda: datetime.utcnow().isoformat(),
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -130,7 +123,12 @@ class MLFraudScorer:
         """Convert an ``EnrichedTransaction`` into the numeric feature
         vector expected by the model.
 
-        Returns a 1-D ``np.ndarray`` of shape ``(n_features,)``.
+        Categorical variables (merchant_category_code, channel) are one-hot
+        encoded to avoid leaking false ordinality into tree-based models.
+        Unknown categories get all-zero encoding rather than being mapped
+        to a shared bucket.
+
+        Returns a 1-D ``np.ndarray``.
         """
         txn = enriched.transaction
 
@@ -148,21 +146,33 @@ class MLFraudScorer:
             (txn.amount / avg_amount) if avg_amount > 0 else 1.0
         )
 
+        # One-hot encode MCC. Unknown MCCs get all-zero (no false grouping).
+        mcc_onehot = [
+            1.0 if txn.merchant_category_code == mcc else 0.0
+            for mcc in _KNOWN_MCCS
+        ]
+
+        # One-hot encode channel. Unknown channels get all-zero.
+        channel_onehot = [
+            1.0 if txn.channel.value == ch else 0.0
+            for ch in _KNOWN_CHANNELS
+        ]
+
+        numeric_features = [
+            txn.amount,
+            float(txn.is_recurring),
+            float(hour_of_day),
+            float(day_of_week),
+            enriched.days_since_last_txn if enriched.days_since_last_txn is not None else -1.0,
+            avg_amount if avg_amount is not None else -1.0,
+            float(enriched.txn_count_30d) if enriched.txn_count_30d is not None else -1.0,
+            amount_deviation_ratio,
+            float(enriched.is_new_merchant),
+            float(enriched.is_high_risk_country),
+        ]
+
         features = np.array(
-            [
-                txn.amount,
-                _MCC_ENCODING.get(txn.merchant_category_code, len(_MCC_ENCODING)),
-                _CHANNEL_ENCODING.get(txn.channel.value, len(_CHANNEL_ENCODING)),
-                float(txn.is_recurring),
-                float(hour_of_day),
-                float(day_of_week),
-                enriched.days_since_last_txn if enriched.days_since_last_txn is not None else -1.0,
-                avg_amount if avg_amount is not None else -1.0,
-                float(enriched.txn_count_30d) if enriched.txn_count_30d is not None else -1.0,
-                amount_deviation_ratio,
-                float(enriched.is_new_merchant),
-                float(enriched.is_high_risk_country),
-            ],
+            numeric_features + mcc_onehot + channel_onehot,
             dtype=np.float64,
         )
         return features

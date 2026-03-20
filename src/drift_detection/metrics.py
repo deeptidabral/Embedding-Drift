@@ -66,13 +66,21 @@ def maximum_mean_discrepancy(
     """
     _validate_shapes(reference, production)
 
+    # Compute kernel bandwidth ONCE on pooled data. Using different
+    # bandwidths for K_XX, K_YY, and K_XY would evaluate each term in
+    # a different RKHS, invalidating the unbiased MMD estimator.
+    combined = np.concatenate([reference, production], axis=0)
+    if kernel == "rbf":
+        pooled_dists = cdist(combined, combined, metric="sqeuclidean")
+        fixed_sigma2 = float(np.median(pooled_dists)) + 1e-8
+    else:
+        fixed_sigma2 = 1.0  # unused for linear kernel
+
     def _kernel_matrix(x: np.ndarray, y: np.ndarray) -> np.ndarray:
         if kernel == "linear":
             return x @ y.T
-        # RBF
-        dists = cdist(x, y, metric="sqeuclidean")
-        sigma2 = np.median(dists) + 1e-8
-        return np.exp(-dists / (2.0 * sigma2))
+        d_xy = cdist(x, y, metric="sqeuclidean")
+        return np.exp(-d_xy / (2.0 * fixed_sigma2))
 
     k_rr = _kernel_matrix(reference, reference)
     k_pp = _kernel_matrix(production, production)
@@ -91,8 +99,13 @@ def maximum_mean_discrepancy(
         - 2.0 * k_rp.sum() / (n * m)
     )
 
-    # Permutation test
-    combined = np.concatenate([reference, production], axis=0)
+    # Clamp negative values. The unbiased estimator of squared MMD can
+    # yield slightly negative values due to finite sample variance when
+    # the distributions are nearly identical. Clamping to zero avoids
+    # confusing downstream dashboards and human analysts.
+    mmd2 = max(0.0, mmd2)
+
+    # Permutation test (reuses pooled bandwidth computed above).
     n_permutations = 200
     count_ge = 0
     rng = np.random.default_rng(seed=42)

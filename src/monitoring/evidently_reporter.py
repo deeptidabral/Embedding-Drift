@@ -129,57 +129,58 @@ class EvidentlyDriftReporter:
     ) -> EvidentlyDriftSummary:
         """Generate an Evidently report comparing embedding distributions.
 
-        Converts the raw numpy arrays into DataFrames with embedding
-        component columns and runs Evidently's DataDriftPreset on a
-        subset of principal components to keep runtime manageable.
+        Projects high-dimensional embeddings to principal components via
+        PCA before running Evidently's DataDriftPreset. Raw dimension
+        slicing is avoided because transformer embeddings distribute
+        information across all dimensions, not in index order.
         """
+        from sklearn.decomposition import PCA
+
         dim = reference_embeddings.shape[1]
         n_components = min(dim, 20)
-        emb_columns = [f"emb_{i}" for i in range(n_components)]
+        emb_columns = [f"pc_{i}" for i in range(n_components)]
 
-        ref_df = pd.DataFrame(
-            reference_embeddings[:, :n_components], columns=emb_columns
-        )
-        prod_df = pd.DataFrame(
-            production_embeddings[:, :n_components], columns=emb_columns
-        )
+        # Project to principal components (fitted on reference).
+        pca = PCA(n_components=n_components)
+        ref_reduced = pca.fit_transform(reference_embeddings)
+        prod_reduced = pca.transform(production_embeddings)
+
+        ref_df = pd.DataFrame(ref_reduced, columns=emb_columns)
+        prod_df = pd.DataFrame(prod_reduced, columns=emb_columns)
 
         report = Report([DataDriftPreset()])
         snapshot = report.run(reference_data=ref_df, current_data=prod_df)
 
         # Extract results from the v0.7 snapshot API.
-        result_dict = snapshot.dict()
-        metrics_list = result_dict.get("metrics", [])
-
         dataset_drift = False
         share_drifted = 0.0
         n_drifted = 0
         n_columns_total = n_components
         per_column: dict[str, float] = {}
+        _parse_failed = False
 
-        # Parse metric results from the dict representation.
-        for item in metrics_list:
-            val = item if isinstance(item, dict) else {}
-            if "drift_share" in str(val) or "DriftedColumnsCount" in str(val):
-                # Try to extract count/share from the result value.
-                pass
-
-        # Use the metric_results attribute for more reliable extraction.
         try:
             for key, mr in snapshot.metric_results.items():
                 mr_str = str(mr)
                 if "share" in key.lower() or "share" in mr_str.lower():
-                    if hasattr(mr, "metric_value"):
+                    if hasattr(mr, "metric_value") and mr.metric_value is not None:
                         share_drifted = float(mr.metric_value)
                 if hasattr(mr, "value"):
                     if "count" in mr_str.lower() and "drift" in mr_str.lower():
                         n_drifted = int(getattr(mr, "value", 0))
-        except Exception:
-            pass
+        except Exception as exc:
+            # FAIL-SAFE: if parsing breaks, assume drift to force manual
+            # review rather than silently reporting "all clear".
+            logger.error(
+                "Failed to parse Evidently snapshot metrics: %s. "
+                "Setting drift_detected=True as a fail-safe.", exc
+            )
+            _parse_failed = True
+            share_drifted = 1.0
+            dataset_drift = True
 
-        # Compute a simple embedding drift score from per-column analysis.
         emb_drift_score = share_drifted
-        emb_drift_detected = share_drifted > 0.3
+        emb_drift_detected = _parse_failed or share_drifted > 0.3
 
         # Save HTML report.
         html_path = None

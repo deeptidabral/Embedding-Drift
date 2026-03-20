@@ -299,7 +299,7 @@ Note: dimension ranges are illustrative. In practice, transformer-based embeddin
 ```python
 results = index.query(
     vector=transaction_embedding,
-    top_k=20,
+    top_k=5,
     filter={"mcc": {"$eq": transaction.mcc}, "days_ago": {"$lte": 90}},
     include_metadata=True
 )
