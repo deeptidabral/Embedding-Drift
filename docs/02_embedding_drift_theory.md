@@ -5,7 +5,7 @@
 - Embedding drift is silent degradation of the embedding space powering the RAG complement layer in dual-layer fraud detection systems.
 - Unlike crashes or errors, drift produces subtly wrong results that accumulate until the complement layer operates well below intended performance.
 - Distinct from ML model feature drift (which affects the primary scorer's structured inputs). Both must be tracked as they can compound.
-- **Note on embedding approach**: the text embedding method described in this project (e.g., all-MiniLM-L6-v2 over transaction text) is a simplified demonstration. Production fraud detection systems typically represent transactions via entity embeddings (learned representations of merchants, cardholders, devices), autoencoders over structured feature sets, or graph neural networks (GNNs) that capture relational structure across transaction networks. The drift theory and MMD-based detection framework apply regardless of the embedding method.
+- _**Note on embedding approach**: the text embedding method described in this project (e.g., all-MiniLM-L6-v2 over transaction text) is a simplified demonstration. Production fraud detection systems typically represent transactions via entity embeddings (learned representations of merchants, cardholders, devices), autoencoders over structured feature sets, or graph neural networks (GNNs) that capture relational structure across transaction networks. The drift theory and MMD-based detection framework apply regardless of the embedding method._
 
 ---
 
