@@ -58,7 +58,6 @@
                           |  - Run Tracing      |
                           |  - Drift Evaluators |
                           |  - Dashboards       |
-                          |  - Alerts           |
                           +---------------------+
 ```
 
@@ -72,7 +71,7 @@
 
 - **Run tracing**: every async investigation run is logged as a LangSmith run (raw transaction text, embedding vector, retrieved documents, LLM-generated investigation report). This traces the investigation pipeline, not the authorization path.
 - **Custom evaluators**: asynchronous evaluators consume batches of recent investigation runs, compute drift statistics against the reference distribution, and post results as feedback scores.
-- **Dashboard and alerting**: dashboard panels visualize investigation quality and drift over time. Threshold-based alerts trigger Slack and PagerDuty notifications when investigation quality degrades.
+- **Dashboard and alerting**: dashboard panels visualize investigation quality and drift over time. Threshold-based alerts can be routed to operational alerting channels (to be configured per deployment) when investigation quality degrades.
 
 ---
 
@@ -388,21 +387,22 @@ def compute_drift_retrieval_correlation(lookback_hours: int = 24):
 
 ---
 
-## Alerting Configuration and Escalation
+## Recommended Operational Procedures for Alert Escalation
 
-### Alert Escalation Path
+The following escalation procedures are recommended for production deployments. This project does not implement alerting; the specific alerting channels and integrations would be configured per deployment.
+
+### Recommended Escalation Path
 
 ```
 +-------------------+      Cosine > 0.15      +-------------------+
 |                   |      or MMD > 0.08       |                   |
 |     NOMINAL       | -----------------------> |     WARNING       |
 |                   |                          |                   |
-| - Metrics logged  |                          | - Slack notify    |
-| - Dashboards      |                          |   #fraud-model-   |
-|   updated         |                          |   alerts          |
-| - No human        |                          | - Monitoring      |
-|   notification    |                          |   frequency 2x    |
-|                   |                          | - Per-dimension   |
+| - Metrics logged  |                          | - Alert on-call   |
+| - Dashboards      |                          |   team            |
+|   updated         |                          | - Monitoring      |
+| - No human        |                          |   frequency 2x    |
+|   notification    |                          | - Per-dimension   |
 |                   |                          |   audit triggered |
 |                   |                          | - Affected txns   |
 |                   |                          |   flagged for     |
@@ -416,7 +416,8 @@ def compute_drift_retrieval_correlation(lookback_hours: int = 24):
                                                |                   |
                                                |     CRITICAL      |
                                                |                   |
-                                               | - PagerDuty page  |
+                                               | - Page on-call    |
+                                               |   engineer        |
                                                | - Complement      |
                                                |   layer bypassed  |
                                                | - Emergency       |
@@ -430,47 +431,17 @@ def compute_drift_retrieval_correlation(lookback_hours: int = 24):
                                                +-------------------+
 ```
 
-### Alert Routing
+### Recommended Alert Routing
 
 - **Nominal**: metrics logged, dashboards updated, no human notification.
-- **Warning**: Slack notification to #fraud-model-alerts with on-call ML engineer mentioned. Monitoring frequency automatically doubled. Embedding quality audit triggered (per-dimension drift stats). Recent transactions under warning-level drift flagged for manual review.
-- **Critical**: PagerDuty incident page to on-call engineer. Complement layer bypassed so gray zone and high-value transactions go to manual review or ML-only with conservative thresholds. Emergency reindexing/retraining pipeline triggered. Production embedding snapshot captured for forensics. ML model continues normally if its own drift metrics are within bounds.
+- **Warning**: alert on-call team via operational alerting channels (to be configured per deployment). Monitoring frequency automatically doubled. Embedding quality audit triggered (per-dimension drift stats). Recent transactions under warning-level drift flagged for manual review.
+- **Critical**: page on-call engineer via operational alerting channels (to be configured per deployment). Complement layer bypassed so gray zone and high-value transactions go to manual review or ML-only with conservative thresholds. Emergency reindexing/retraining pipeline triggered. Production embedding snapshot captured for forensics. ML model continues normally if its own drift metrics are within bounds.
 
 ### Deduplication and Alert Fatigue Prevention
 
 - At payment processor scale (billions of transactions per year), drift metrics fluctuate rapidly.
-- Alerts deduplicated within a 30-minute window. Maximum 3 alerts per window across severity levels.
-- Severity escalation resets the deduplication window. A critical alert fires immediately even if a warning dedup is active.
-
-```python
-import hashlib
-from datetime import datetime, timedelta
-
-_alert_cache = {}
-
-
-def should_send_alert(severity: str, metric_name: str) -> bool:
-    """Check deduplication cache before sending an alert."""
-    cache_key = hashlib.sha256(f"{severity}:{metric_name}".encode()).hexdigest()
-    now = datetime.utcnow()
-    window = timedelta(minutes=30)
-
-    if cache_key in _alert_cache:
-        last_sent, count = _alert_cache[cache_key]
-        if now - last_sent < window and count >= 3:
-            return False
-
-    if cache_key in _alert_cache:
-        last_sent, count = _alert_cache[cache_key]
-        if now - last_sent < window:
-            _alert_cache[cache_key] = (last_sent, count + 1)
-        else:
-            _alert_cache[cache_key] = (now, 1)
-    else:
-        _alert_cache[cache_key] = (now, 1)
-
-    return True
-```
+- In production, alerts should be deduplicated within a 30-minute window, with a maximum of 3 alerts per window across severity levels.
+- Severity escalation should reset the deduplication window. A critical alert should fire immediately even if a warning dedup is active.
 
 ---
 
@@ -549,7 +520,7 @@ def should_send_alert(severity: str, metric_name: str) -> bool:
 
 ### Division of Responsibilities
 
-- **LangSmith**: continuous monitoring of the async investigation pipeline. Every investigation run traced. Rolling drift scores attached to runs. Alerts on threshold breach. Monitors investigation quality, not authorization latency.
+- **LangSmith**: continuous monitoring of the async investigation pipeline. Every investigation run traced. Rolling drift scores attached to runs. Threshold breach detection for downstream action. Monitors investigation quality, not authorization latency.
 - **Evidently**: periodic deep-dive analysis (hourly/daily). Comprehensive drift reports with per-feature statistical tests, embedding distribution comparisons, and visual diagnostics. Standalone HTML reports for stakeholders, incident tickets, and regulatory archives.
 
 ### Evidently Integration Points
@@ -591,14 +562,9 @@ result = reporter.generate_dual_layer_report(
 print(result["risk_assessment"])
 ```
 
-### Bridging Evidently Results into the Alerting Pipeline
+### Bridging Evidently Results into the Monitoring Pipeline
 
-```python
-drift_report = reporter.to_drift_report(embedding_summary)
-# drift_report.overall_severity can now drive AlertManager
-```
-
-- Evidently-derived drift scores flow into the same alerting and dashboard infrastructure used by custom statistical metrics and LangSmith feedback scores.
+- Evidently-derived drift scores flow into the same dashboard infrastructure used by custom statistical metrics and LangSmith feedback scores. In production, these scores can also drive operational alerting channels (to be configured per deployment).
 
 ### When to Use Each Tool
 

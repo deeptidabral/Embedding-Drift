@@ -178,18 +178,18 @@ Actions are cumulative: warning includes all nominal actions. Critical includes 
 | Nominal           | Log MMD metric, update dashboards, | None required. Weekly review      |
 |                   | store in time-series DB.           | during governance meeting.        |
 +-------------------+------------------------------------+-----------------------------------+
-| Warning:          | Slack alert, double monitoring     | On-call acknowledges within       |
+| Warning:          | Alert on-call team, double monitoring     | On-call acknowledges within       |
 | Embedding Drift   | frequency, trigger embedding       | 30 min. Investigate root cause.   |
 | (MMD warning)     | quality audit, flag transactions   | Review category heatmap and       |
 |                   | for manual review, compute         | retrieval quality. Check ML       |
 |                   | per-merchant breakdown.            | agreement rate. Document.         |
 +-------------------+------------------------------------+-----------------------------------+
-| Warning:          | Slack alert with ML context,       | Review ML feature drift           |
+| Warning:          | Alert on-call team with ML context,       | Review ML feature drift           |
 | ML Feature Drift  | monitor complement layer volume,   | dashboard. Assess routing         |
 |                   | flag ML revalidation for next      | impact on complement layer.       |
 |                   | governance cycle.                  | Evaluate gray zone absorption.    |
 +-------------------+------------------------------------+-----------------------------------+
-| Critical:         | PagerDuty page, bypass complement  | On-call acknowledges within       |
+| Critical:         | Page on-call engineer, bypass complement  | On-call acknowledges within       |
 | Embedding Drift   | layer, trigger emergency           | 15 min. Initiate incident         |
 | (MMD critical)    | reindexing, snapshot embeddings    | response. Assess adversarial      |
 |                   | for forensics, notify risk mgmt.   | activity. Coordinate fraud ops.   |
@@ -217,21 +217,21 @@ ML feature drift condition: per-feature PSI < 0.10, score distribution shift wit
 
 Condition: MMD >= 0.02 (p <= 0.01).
 
-- **Automated**: Slack to #fraud-model-alerts, double monitoring frequency, trigger embedding quality audit, flag affected transactions for manual review, compute per-merchant-category breakdown, check ML drift correlation.
+- **Automated**: alert on-call team, double monitoring frequency, trigger embedding quality audit, flag affected transactions for manual review, compute per-merchant-category breakdown, check ML drift correlation.
 - **Manual**: on-call acknowledges within 30 min. Investigate root cause (market evolution vs embedding model change vs adversarial). Review category heatmap and retrieval quality correlation. Check ML agreement rate. Document findings.
 
 ### Warning: ML Feature Drift Only (Embedding MMD Nominal)
 
 Condition: per-feature PSI >= 0.10 on 2+ top features, or score distribution shift exceeds warning, or gray zone routing rate exceeds 95th percentile.
 
-- **Automated**: Slack to #fraud-model-alerts with ML drift context, monitor complement layer volume for routing rate increases, flag ML revalidation for next governance cycle.
+- **Automated**: alert on-call team with ML drift context, monitor complement layer volume for routing rate increases, flag ML revalidation for next governance cycle.
 - **Manual**: review ML feature drift dashboard. Assess routing impact on complement layer. Evaluate whether complement layer can absorb increased gray zone volume. Document findings.
 
 ### Critical: Embedding Drift (MMD Exceeds Critical Threshold)
 
 Condition: MMD >= 0.08 (p < 0.001).
 
-- **Automated**: PagerDuty page, bypass complement layer (route to manual review or ML-only with conservative thresholds), trigger emergency reindexing, snapshot production embeddings for forensics, notify risk management.
+- **Automated**: Page on-call engineer, bypass complement layer (route to manual review or ML-only with conservative thresholds), trigger emergency reindexing, snapshot production embeddings for forensics, notify risk management.
 - **Manual**: on-call acknowledges within 15 min. Initiate incident response. Assess if adversarial (active fraud campaign). Coordinate with fraud ops on manual review queue surge. Assess financial exposure. Prepare risk committee report.
 
 ### Critical: Compound Drift (Both Layers Simultaneously)

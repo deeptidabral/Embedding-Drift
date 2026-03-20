@@ -270,7 +270,7 @@ _ACTIONS: dict[str, list[str]] = {
     "warning": [
         "log_metrics",
         "update_dashboard",
-        "notify_oncall_slack",
+        "notify_oncall",
         "increase_monitoring_frequency",
     ],
     "critical": [
@@ -472,7 +472,7 @@ def main() -> None:
         "shifting) is the highest-risk scenario because more transactions\n"
         "enter the gray zone while the async LLM investigation that handles\n"
         "them is also unreliable.\n"
-        "Reports are streamed to LangSmith and alert channels (Slack, PagerDuty)."
+        "Reports are streamed to LangSmith for dashboard visibility."
     )
     print()
 

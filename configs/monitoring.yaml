@@ -57,24 +57,6 @@ langsmith:
         chart_type: "heatmap"
         group_by: "merchant_category_code"
 
-alerting:
-  channels:
-    slack:
-      webhook_env_var: "SLACK_DRIFT_WEBHOOK_URL"
-      channel: "#fraud-model-alerts"
-      mention_on_critical: "@oncall-ml-engineer"
-
-    pagerduty:
-      routing_key_env_var: "PAGERDUTY_ROUTING_KEY"
-      severity_mapping:
-        warning: "warning"
-        critical: "critical"
-
-  # Deduplication to prevent alert fatigue
-  deduplication:
-    window_minutes: 30
-    max_alerts_per_window: 3
-
 logging:
   level: "INFO"
   format: "json"

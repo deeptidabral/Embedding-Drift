@@ -173,7 +173,6 @@ embedding-drift/
 |   |   |-- transaction_processor.py
 |   |-- monitoring/
 |   |   |-- __init__.py
-|   |   |-- alerts.py
 |   |   |-- dashboard.py
 |   |   |-- evidently_reporter.py
 |   |   |-- langsmith_reporter.py
@@ -299,7 +298,6 @@ pytest tests/ -v
 | Drift Reporting | Evidently AI | Periodic HTML drift reports with PCA-projected embedding analysis. |
 | LLM Observability | LangSmith | Async investigation pipeline tracing, custom feedback scores, dashboards. |
 | Data Drift | Custom (concept, covariate, target shift) | ML model input feature drift detection. |
-| Alerting | PagerDuty, Slack webhooks | Drift alert delivery. |
 | Data Processing | Pandas | Transaction data manipulation and feature engineering. |
 | Visualization | Matplotlib, Seaborn | Embedding space, drift metrics, pipeline architecture charts. |
 | Configuration | Pydantic, PyYAML | Data validation, model schemas, config management. |

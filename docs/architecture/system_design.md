@@ -143,13 +143,6 @@ Design priorities:
                           +--------+------------+       |   Dashboard)      |
                                    |                    +-------------------+
                                    v
-                          +--------+------------+       +-------------------+
-                          |                     |       |                   |
-                          |  Alert Router       |------>|  Slack +          |
-                          |                     |       |  PagerDuty        |
-                          +--------+------------+       +-------------------+
-                                   |
-                                   v
                           +--------+------------+
                           |                     |
                           |  Fallback           |
@@ -212,9 +205,6 @@ Design priorities:
 +----------------------------+---------------------------+-----------+-----------------------------+
 | LangSmith                  | Tracing + evaluation +    | Async     | No impact on transactions.  |
 |                            | dashboard (60s refresh)   |           | Monitoring visibility lost. |
-+----------------------------+---------------------------+-----------+-----------------------------+
-| Alert Router               | Slack + PagerDuty         | Async     | No impact on transactions.  |
-|                            | (dedup: 3/30min/source)   |           | Alerts queued for retry.    |
 +----------------------------+---------------------------+-----------+-----------------------------+
 | Fallback Controller        | Mode switching logic      | <1ms      | Defaults to most            |
 |                            |                           |           | conservative mode.          |
@@ -293,11 +283,15 @@ Design priorities:
 - Analyzes cross-layer drift signals and tracks temporal alignment between drift events.
 - Escalates alert severity for correlated cross-layer drift.
 
-### Alert Router
+### Alert Delivery (Recommended Integration Point)
 
-- Slack: warning-level and above to #fraud-model-alerts. @oncall-ml-engineer on critical.
-- PagerDuty: critical-level only with severity-based routing.
+In production, drift severity changes would be routed to operational alerting channels (to be configured per deployment). Recommended configuration:
+
+- Warning-level and above: alert on-call team.
+- Critical-level: page on-call engineer.
 - Deduplication: max 3 alerts per 30-min window per severity level per drift source.
+
+This project does not implement alert delivery. The drift correlation engine produces severity classifications that can drive any external alerting system.
 
 ### Fallback Controller
 
@@ -370,7 +364,7 @@ Design priorities:
 [15] ML Feature Drift Monitor (every 15 min PSI/KS, hourly concept drift)
 [16] Embedding Drift Monitor (every 5-15 min, plus continuous CUSUM)
 [17] Drift Correlation Engine (cross-layer signal analysis)
-[18] Alert Router --> Slack / PagerDuty (if thresholds exceeded)
+[18] Drift severity classification (drives operational alerting in production)
 [19] Fallback Controller (adjust processing mode if needed)
 ```
 
@@ -454,7 +448,7 @@ The LLM assessor is the most expensive component per-transaction, but it operate
 ### Cascading Failure Prevention
 
 - Critical authorization path (ingestion, feature extraction, ML scoring, routing) is fully isolated from the async RAG+LLM investigation pipeline and monitoring plane.
-- Failure in RAG+LLM investigation, drift monitors, LangSmith, or alert router does not affect real-time authorization decisions.
+- Failure in RAG+LLM investigation, drift monitors, or LangSmith does not affect real-time authorization decisions.
 - Circuit breakers at each external dependency boundary (embedding API, LLM API, vector store, LangSmith).
 - ML scorer has no external API dependencies at inference time (model loaded locally).
 
