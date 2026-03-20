@@ -75,7 +75,7 @@ class FraudPatternRetriever:
         self,
         store: EmbeddingStore,
         reranker: Any | None = None,
-        default_top_k: int = 20,
+        default_top_k: int = 5,
         rerank_top_k: int = 5,
     ) -> None:
         self._store = store

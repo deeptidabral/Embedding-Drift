@@ -143,7 +143,7 @@ class EmbeddingStore:
     def query_similar(
         self,
         query_embedding: list[float],
-        top_k: int = 10,
+        top_k: int = 5,
         where: dict[str, Any] | None = None,
         *,
         from_reference: bool = False,

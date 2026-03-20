@@ -55,7 +55,7 @@
 +------------------+     +-------------------+     +-----------------------+     +-------------------+
 | Incoming         |     | Embed Transaction |     | Vector Database       |     | LLM Risk          |
 | Transaction      | --> | (all-MiniLM-L6-v2)| --> | Query (ANN search,    | --> | Assessment        |
-| (gray zone,      |     |                   |     |  k=20 neighbors,      |     | (weigh retrieved  |
+| (gray zone,      |     |                   |     |  k=5 neighbors,      |     | (weigh retrieved  |
 |  high-value, or  |     |                   |     |  MCC + time filters)  |     |  cases, produce   |
 |  novel pattern)  |     |                   |     |                       |     |  score + reason)  |
 |                  |     | Output: 384-dim   |     | Output: 20 similar    |     |                   |
@@ -259,7 +259,7 @@ Note: dimension ranges are illustrative. In practice, transformer-based embeddin
                           | RAG+LLM Complement  |         | (85-95% of       |
                           |                     |         |  transactions)   |
                           | 1. Embed transaction|         +------------------+
-                          | 2. Retrieve k=20    |
+                          | 2. Retrieve k=5    |
                           |    similar cases    |
                           | 3. LLM synthesizes  |
                           |    risk assessment  |
@@ -293,7 +293,7 @@ Note: dimension ranges are illustrative. In practice, transformer-based embeddin
 
 ### Retrieval Phase
 
-- Each routed transaction is embedded and queried against a vector database of labeled historical transactions (typically k=10 to 50 nearest neighbors).
+- Each routed transaction is embedded and queried against a vector database of labeled historical transactions (k=5 nearest neighbors).
 - Entirely dependent on embedding quality. Drifted embeddings produce less relevant retrievals for exactly the cases that need it most.
 
 ```python
@@ -337,7 +337,7 @@ Past 24h: 1 transaction (grocery, $67.50)
 
 ### Retrieval Precision
 
-- High quality: precision at k=20 is 0.75 to 0.85 (15 to 17 of 20 results relevant).
+- High quality: precision at k=5 is 0.75 to 0.85 (4 to 5 of 5 results relevant).
 - Degraded: precision drops to 0.40 to 0.55. Nearly half the context is noise.
 
 ### Decision Boundary Sharpness
