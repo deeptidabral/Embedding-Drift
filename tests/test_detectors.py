@@ -1,21 +1,26 @@
 """
 Test suite for src.drift_detection.detectors.
 
-Validates the EmbeddingDriftDetector ensemble logic, severity classification,
-and DriftReport model structure.  All external configuration is mocked so
-that tests are fully self-contained.
+Validates the EmbeddingDriftDetector MMD-based detection, severity
+classification, and DriftReport model structure.  All external
+configuration is mocked so that tests are fully self-contained.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import numpy as np
 import pytest
 
-from src.drift_detection.detectors import DriftReport, EmbeddingDriftDetector
+from src.drift_detection.detectors import (
+    DriftReport,
+    DriftSeverity,
+    EmbeddingDriftDetector,
+    MetricThresholds,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
@@ -25,49 +30,19 @@ RNG = np.random.default_rng(99)
 DIM = 64
 N_SAMPLES = 300
 
-# Default threshold config that mirrors configs/drift_thresholds.yaml
-_THRESHOLDS: dict[str, dict[str, Any]] = {
-    "cosine_distance": {
-        "nominal_upper": 0.05,
-        "warning_upper": 0.15,
-        "critical_upper": 0.30,
-    },
-    "maximum_mean_discrepancy": {
-        "nominal_upper": 0.02,
-        "warning_upper": 0.08,
-        "critical_upper": 0.20,
-    },
-    "kolmogorov_smirnov": {
-        "nominal_upper": 0.05,
-        "warning_upper": 0.12,
-        "critical_upper": 0.25,
-    },
-    "wasserstein_distance": {
-        "nominal_upper": 0.03,
-        "warning_upper": 0.10,
-        "critical_upper": 0.22,
-    },
-    "population_stability_index": {
-        "nominal_upper": 0.10,
-        "warning_upper": 0.20,
-        "critical_upper": 0.35,
-    },
-}
 
-
-def _make_detector(
-    min_metrics_agreeing: int = 2,
-) -> EmbeddingDriftDetector:
-    """Create a detector with mocked config loading."""
+def _make_detector() -> EmbeddingDriftDetector:
+    """Create a detector with mocked config loading (uses built-in defaults)."""
     with patch.object(
         EmbeddingDriftDetector,
         "_load_thresholds",
-        return_value=_THRESHOLDS,
+        return_value={
+            "mmd": MetricThresholds(
+                low=0.005, moderate=0.02, high=0.05, critical=0.10
+            ),
+        },
     ):
-        detector = EmbeddingDriftDetector(
-            thresholds=_THRESHOLDS,
-            min_metrics_agreeing=min_metrics_agreeing,
-        )
+        detector = EmbeddingDriftDetector()
     return detector
 
 
@@ -85,26 +60,15 @@ class TestDetectorInit:
     """Verify that EmbeddingDriftDetector initializes correctly."""
 
     def test_default_construction(self) -> None:
-        """Detector should store thresholds and ensemble parameter."""
+        """Detector should initialize without errors."""
         detector = _make_detector()
-        assert detector.min_metrics_agreeing == 2
+        assert detector is not None
 
-    def test_custom_min_metrics(self) -> None:
-        """min_metrics_agreeing should accept arbitrary positive integers."""
-        detector = _make_detector(min_metrics_agreeing=4)
-        assert detector.min_metrics_agreeing == 4
-
-    def test_thresholds_loaded(self) -> None:
-        """All five metrics should be present in the loaded thresholds."""
+    def test_thresholds_contain_mmd(self) -> None:
+        """Only MMD thresholds should be present."""
         detector = _make_detector()
-        expected_keys = {
-            "cosine_distance",
-            "maximum_mean_discrepancy",
-            "kolmogorov_smirnov",
-            "wasserstein_distance",
-            "population_stability_index",
-        }
-        assert expected_keys.issubset(set(detector.thresholds.keys()))
+        assert "mmd" in detector._thresholds
+        assert len(detector._thresholds) == 1
 
 
 # ===================================================================
@@ -116,58 +80,53 @@ class TestDetectorInit:
 class TestEvaluateSeverity:
     """Verify that evaluate() returns the correct severity level."""
 
-    def test_no_drift_returns_nominal(self) -> None:
-        """When reference and production are the same, severity is nominal."""
+    def test_no_drift_returns_none_or_low(self) -> None:
+        """When reference and production are the same, severity should be NONE."""
         detector = _make_detector()
         ref = _standard_embeddings()
         report = detector.evaluate(ref, ref)
-        assert report.severity == "nominal"
+        assert report.overall_severity in (DriftSeverity.NONE, DriftSeverity.LOW)
 
-    def test_moderate_drift_returns_warning(self) -> None:
-        """A moderate distributional shift should trigger a warning."""
+    def test_moderate_drift(self) -> None:
+        """A moderate distributional shift should trigger at least LOW severity."""
         detector = _make_detector()
         ref = _standard_embeddings()
-        # Shift enough to exceed warning thresholds on most metrics
         prod = ref + 0.8
         report = detector.evaluate(ref, prod)
-        assert report.severity in ("warning", "critical")
+        assert report.overall_severity != DriftSeverity.NONE
 
     def test_severe_drift_returns_critical(self) -> None:
-        """A large distributional shift should trigger critical severity."""
+        """A large distributional shift should trigger HIGH or CRITICAL severity."""
         detector = _make_detector()
         ref = _standard_embeddings()
         prod = _standard_embeddings() + 10.0
         report = detector.evaluate(ref, prod)
-        assert report.severity == "critical"
+        assert report.overall_severity in (DriftSeverity.HIGH, DriftSeverity.CRITICAL)
 
 
 # ===================================================================
-# Ensemble logic
+# MMD-only detection (no ensemble)
 # ===================================================================
 
 
 @pytest.mark.unit
-class TestEnsembleLogic:
-    """Verify ensemble voting respects min_metrics_agreeing."""
+class TestMMDOnly:
+    """Verify detector uses only MMD, not an ensemble."""
 
-    def test_high_agreement_threshold_reduces_sensitivity(self) -> None:
-        """Requiring all 5 metrics to agree makes detection less sensitive."""
-        strict_detector = _make_detector(min_metrics_agreeing=5)
+    def test_single_metric_result(self) -> None:
+        """evaluate() should return exactly one metric result (MMD)."""
+        detector = _make_detector()
         ref = _standard_embeddings()
-        # A marginal shift may only push some metrics past warning
-        prod = ref + 0.5
-        report = strict_detector.evaluate(ref, prod)
-        # With a strict agreement threshold, mild drift is more likely nominal
-        assert report.severity in ("nominal", "warning")
+        report = detector.evaluate(ref, ref)
+        assert len(report.metric_results) == 1
+        assert report.metric_results[0].metric_name == "mmd"
 
-    def test_low_agreement_threshold_increases_sensitivity(self) -> None:
-        """Requiring only 1 metric to agree makes detection more sensitive."""
-        sensitive_detector = _make_detector(min_metrics_agreeing=1)
+    def test_per_metric_severity_has_only_mmd(self) -> None:
+        """per_metric_severity should contain only the 'mmd' key."""
+        detector = _make_detector()
         ref = _standard_embeddings()
-        prod = ref + 0.5
-        report = sensitive_detector.evaluate(ref, prod)
-        # At least one metric likely fires warning for a 0.5 shift
-        assert report.severity in ("warning", "critical")
+        report = detector.evaluate(ref, ref)
+        assert list(report.per_metric_severity.keys()) == ["mmd"]
 
 
 # ===================================================================
@@ -179,51 +138,76 @@ class TestEnsembleLogic:
 class TestDriftReport:
     """Validate the DriftReport pydantic model."""
 
-    def test_construction_with_required_fields(self) -> None:
-        """DriftReport should accept all required fields."""
-        report = DriftReport(
-            severity="warning",
-            metric_scores={
-                "cosine_distance": 0.12,
-                "maximum_mean_discrepancy": 0.06,
-            },
-            timestamp=datetime.now(tz=timezone.utc),
-            window_size=1000,
-        )
-        assert report.severity == "warning"
-        assert "cosine_distance" in report.metric_scores
-
-    def test_severity_must_be_valid(self) -> None:
-        """DriftReport should reject an unknown severity string."""
-        with pytest.raises((ValueError, KeyError)):
-            DriftReport(
-                severity="catastrophic",  # invalid
-                metric_scores={"cosine_distance": 0.5},
-                timestamp=datetime.now(tz=timezone.utc),
-                window_size=1000,
-            )
-
-    def test_metric_scores_dict(self) -> None:
-        """metric_scores should be a dict mapping metric names to floats."""
-        report = DriftReport(
-            severity="nominal",
-            metric_scores={
-                "cosine_distance": 0.01,
-                "wasserstein_distance": 0.02,
-            },
-            timestamp=datetime.now(tz=timezone.utc),
-            window_size=500,
-        )
-        assert isinstance(report.metric_scores, dict)
-        for v in report.metric_scores.values():
-            assert isinstance(v, float)
-
     def test_report_from_evaluate(self) -> None:
         """evaluate() should return a well-formed DriftReport."""
         detector = _make_detector()
         ref = _standard_embeddings()
         report = detector.evaluate(ref, ref)
         assert isinstance(report, DriftReport)
-        assert hasattr(report, "severity")
-        assert hasattr(report, "metric_scores")
+        assert hasattr(report, "overall_severity")
+        assert hasattr(report, "metric_results")
         assert hasattr(report, "timestamp")
+
+    def test_report_has_recommended_actions(self) -> None:
+        """DriftReport should include recommended actions."""
+        detector = _make_detector()
+        ref = _standard_embeddings()
+        report = detector.evaluate(ref, ref)
+        assert isinstance(report.recommended_actions, list)
+        assert len(report.recommended_actions) > 0
+
+    def test_report_has_sample_counts(self) -> None:
+        """DriftReport should record the number of reference and production samples."""
+        detector = _make_detector()
+        ref = _standard_embeddings(n=100)
+        prod = _standard_embeddings(n=50)
+        report = detector.evaluate(ref, prod)
+        assert report.n_reference == 100
+        assert report.n_production == 50
+
+    def test_report_window_metadata(self) -> None:
+        """DriftReport should carry window start/end when provided."""
+        detector = _make_detector()
+        ref = _standard_embeddings()
+        prod = _standard_embeddings()
+        report = detector.evaluate(
+            ref, prod,
+            window_start="2025-01-01T00:00:00Z",
+            window_end="2025-01-02T00:00:00Z",
+        )
+        assert report.window_start == "2025-01-01T00:00:00Z"
+        assert report.window_end == "2025-01-02T00:00:00Z"
+
+
+# ===================================================================
+# Windowed evaluation
+# ===================================================================
+
+
+@pytest.mark.unit
+class TestEvaluateWindowed:
+    """Verify windowed evaluation across multiple time windows."""
+
+    def test_returns_list_of_reports(self) -> None:
+        """evaluate_windowed should return one report per window."""
+        detector = _make_detector()
+        ref = _standard_embeddings()
+        windows = [
+            ("2025-01-01", "2025-01-02", _standard_embeddings(n=50)),
+            ("2025-01-02", "2025-01-03", _standard_embeddings(n=50)),
+        ]
+        reports = detector.evaluate_windowed(ref, windows)
+        assert len(reports) == 2
+        for r in reports:
+            assert isinstance(r, DriftReport)
+
+    def test_skips_small_windows(self) -> None:
+        """Windows with fewer than 2 samples should be skipped."""
+        detector = _make_detector()
+        ref = _standard_embeddings()
+        windows = [
+            ("2025-01-01", "2025-01-02", _standard_embeddings(n=1)),  # too small
+            ("2025-01-02", "2025-01-03", _standard_embeddings(n=50)),
+        ]
+        reports = detector.evaluate_windowed(ref, windows)
+        assert len(reports) == 1

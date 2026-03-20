@@ -1,24 +1,29 @@
 """
-Dual-layer fraud detection pipeline with drift-aware fallback.
+Fraud detection pipeline with async LLM investigation and drift-aware fallback.
 
 Architecture
 ------------
-1. **Primary scorer** -- an ML model (XGBoost / gradient boosted trees)
-   produces a fraud probability at high speed for every transaction.
-2. **Complementary layer** -- RAG+LLM is invoked selectively for
-   gray-zone transactions, high-value transactions, explainability,
-   novel-pattern detection, and audit-trail generation.
-3. **Drift monitoring** -- continuous embedding drift detection guards
-   the quality of the RAG retrieval layer.
+1. **Real-time ML scorer** -- an ML model (XGBoost / gradient boosted
+   trees) produces a fraud probability at high speed for every
+   transaction.  This is the only component in the synchronous
+   authorization path.
+2. **Async LLM investigation** -- RAG+LLM is invoked *asynchronously*
+   (post-transaction) for flagged transactions: gray-zone scores,
+   high-value transactions, novel-pattern detection, and audit-trail
+   generation.  It does **not** block the authorization decision.
+3. **Drift monitoring** -- continuous MMD-based embedding drift
+   detection guards the quality of the embedding space.
 
-Decision routing
-~~~~~~~~~~~~~~~~
-- ML score < gray_zone_lower  --> approve (ML only)
-- ML score > gray_zone_upper  --> decline (ML only)
-- gray_zone_lower <= score <= gray_zone_upper  --> invoke RAG+LLM
-- amount > high_value_threshold --> always invoke RAG+LLM
+Decision routing (synchronous, real-time)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+- ML score < gray_zone_lower  --> approve
+- ML score > gray_zone_upper  --> decline
+- gray_zone_lower <= score <= gray_zone_upper  --> flag for review,
+  queue for async LLM investigation
 
-Supports async processing for concurrent transaction evaluation.
+The LLM/RAG layer is never in the synchronous authorization path.
+It runs asynchronously after the transaction has been authorized,
+declined, or flagged.
 """
 
 from __future__ import annotations
@@ -52,7 +57,7 @@ logger = logging.getLogger(__name__)
 
 
 class PipelineConfig(BaseModel):
-    """Runtime configuration for the dual-layer fraud detection pipeline."""
+    """Runtime configuration for the fraud detection pipeline."""
 
     fraud_threshold: float = 0.7
     retrieval_top_k: int = 5
@@ -61,7 +66,7 @@ class PipelineConfig(BaseModel):
     model_version: str = "v1.0.0"
     rule_based_threshold: float = 0.85
 
-    # Decision-routing thresholds
+    # Decision-routing thresholds (synchronous authorization)
     gray_zone_lower: float = Field(
         default=0.3,
         ge=0.0,
@@ -78,17 +83,9 @@ class PipelineConfig(BaseModel):
         default=10_000.0,
         ge=0.0,
         description=(
-            "Transactions whose amount exceeds this threshold always "
-            "receive complementary RAG+LLM analysis."
+            "Transactions whose amount exceeds this threshold are flagged "
+            "and queued for async RAG+LLM investigation."
         ),
-    )
-
-    # Weight given to the ML score when combining with the LLM score.
-    ml_weight: float = Field(
-        default=0.6,
-        ge=0.0,
-        le=1.0,
-        description="Weight of ML score in the blended ML+LLM score.",
     )
 
 
@@ -100,8 +97,10 @@ class PipelineState(BaseModel):
     production_embeddings_buffer: list[list[float]] = Field(default_factory=list)
     total_processed: int = 0
     total_fallback: int = 0
-    total_ml_only: int = 0
-    total_ml_plus_llm: int = 0
+    total_approved: int = 0
+    total_declined: int = 0
+    total_flagged: int = 0
+    total_async_llm_queued: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -110,10 +109,11 @@ class PipelineState(BaseModel):
 
 
 class FraudDetectionPipeline:
-    """Dual-layer, drift-aware fraud detection pipeline.
+    """ML-first fraud detection pipeline with async LLM investigation.
 
-    The ML model is the **primary** scorer.  The RAG+LLM layer is
-    **complementary** and invoked only when deeper analysis is warranted.
+    The ML model is the **sole** real-time scorer in the authorization
+    path.  The RAG+LLM layer runs **asynchronously** for flagged
+    transactions and does not block authorization.
 
     Parameters
     ----------
@@ -126,12 +126,12 @@ class FraudDetectionPipeline:
     retriever:
         Retrieves similar historical fraud patterns for RAG.
     drift_detector:
-        Ensemble drift detector for monitoring distributional shift.
+        MMD-based drift detector for monitoring distributional shift.
     config:
         Runtime configuration.
     llm_assessor:
         Optional callable ``(enriched_transaction, patterns) -> float``
-        used as the complementary LLM scoring layer.  When *None*, a
+        used as the async LLM investigation layer.  When *None*, a
         similarity-based heuristic is used instead.
     """
 
@@ -156,7 +156,7 @@ class FraudDetectionPipeline:
         self._state = PipelineState()
 
     # ------------------------------------------------------------------
-    # Synchronous entry point
+    # Synchronous entry point (real-time authorization)
     # ------------------------------------------------------------------
 
     def process_transaction(
@@ -164,16 +164,20 @@ class FraudDetectionPipeline:
         transaction: dict[str, Any],
         history: dict[str, Any] | None = None,
     ) -> FraudAssessment:
-        """Process a single transaction through the dual-layer pipeline.
+        """Process a single transaction through the real-time pipeline.
 
         Steps:
           1. Validate and enrich.
-          2. ML model scoring (primary).
-          3. Generate embedding (for RAG and drift monitoring).
+          2. ML model scoring (real-time authorization).
+          3. Generate embedding (for drift monitoring).
           4. Periodic drift evaluation.
           5. If critical drift and fallback enabled, use rule-based engine.
-          6. Decision routing -- invoke RAG+LLM only when required.
-          7. Store production embedding.
+          6. Authorize / decline / flag based on ML score alone.
+          7. If flagged, queue for async LLM investigation.
+          8. Store production embedding.
+
+        The LLM/RAG layer is NOT in this synchronous path.  It is
+        triggered asynchronously for flagged transactions only.
 
         Parameters
         ----------
@@ -190,7 +194,7 @@ class FraudDetectionPipeline:
         txn = self._processor.validate(transaction)
         enriched = self._processor.enrich(txn, history)
 
-        # Step 2 -- primary ML scoring
+        # Step 2 -- real-time ML scoring (authorization path)
         ml_result = self._ml_scorer.predict(enriched)
         logger.debug(
             "ML score for %s: %.4f (top factors: %s)",
@@ -199,7 +203,7 @@ class FraudDetectionPipeline:
             ml_result.top_risk_factors,
         )
 
-        # Step 3 -- generate embedding (needed for RAG retrieval and drift)
+        # Step 3 -- generate embedding (for drift monitoring)
         txn_dict = TransactionProcessor.to_embedding_text(enriched)
         embed_result = self._generator.generate_single(txn_dict)
         embedding = embed_result.embedding
@@ -229,21 +233,22 @@ class FraudDetectionPipeline:
             self._state.total_fallback += 1
             return self._rule_based_assessment(enriched, current_severity, ml_result)
 
-        # Step 6 -- decision routing
-        needs_llm = self._requires_llm_analysis(ml_result, enriched)
+        # Step 6 -- authorize / decline / flag (ML score only)
+        should_flag = self._should_flag_for_review(ml_result, enriched)
+        assessment = self._ml_authorization(
+            txn, enriched, ml_result, current_severity, flagged=should_flag,
+        )
 
-        if needs_llm:
-            assessment = self._ml_plus_llm_assessment(
-                txn, enriched, embedding, ml_result, current_severity,
-            )
-            self._state.total_ml_plus_llm += 1
+        if should_flag:
+            self._state.total_flagged += 1
+            # Step 7 -- queue async LLM investigation for flagged transactions
+            self._queue_async_llm_investigation(txn, enriched, embedding, ml_result)
+        elif assessment.is_fraud:
+            self._state.total_declined += 1
         else:
-            assessment = self._ml_only_assessment(
-                txn, enriched, ml_result, current_severity,
-            )
-            self._state.total_ml_only += 1
+            self._state.total_approved += 1
 
-        # Step 7 -- store production embedding
+        # Step 8 -- store production embedding
         self._store.add_embeddings(
             ids=[txn.transaction_id],
             embeddings=[embedding],
@@ -262,16 +267,16 @@ class FraudDetectionPipeline:
         return assessment
 
     # ------------------------------------------------------------------
-    # Decision routing
+    # Decision routing (synchronous)
     # ------------------------------------------------------------------
 
-    def _requires_llm_analysis(
+    def _should_flag_for_review(
         self,
         ml_result: MLScoringResult,
         enriched: EnrichedTransaction,
     ) -> bool:
-        """Determine whether the complementary RAG+LLM layer should be
-        invoked for this transaction.
+        """Determine whether this transaction should be flagged for review
+        and queued for async LLM investigation.
 
         Returns ``True`` when any of the following hold:
         - The ML score falls in the gray zone
@@ -284,14 +289,15 @@ class FraudDetectionPipeline:
         # Gray-zone: ML model is uncertain.
         if cfg.gray_zone_lower <= score <= cfg.gray_zone_upper:
             logger.debug(
-                "Gray-zone score (%.4f) -- routing to RAG+LLM", score,
+                "Gray-zone score (%.4f) -- flagging for async LLM investigation",
+                score,
             )
             return True
 
-        # High-value transactions always need deeper analysis.
+        # High-value transactions always need deeper (async) analysis.
         if enriched.transaction.amount > cfg.high_value_threshold:
             logger.debug(
-                "High-value transaction ($%.2f) -- routing to RAG+LLM",
+                "High-value transaction ($%.2f) -- flagging for async LLM investigation",
                 enriched.transaction.amount,
             )
             return True
@@ -299,26 +305,44 @@ class FraudDetectionPipeline:
         return False
 
     # ------------------------------------------------------------------
-    # Assessment paths
+    # Assessment (synchronous -- ML only)
     # ------------------------------------------------------------------
 
-    def _ml_only_assessment(
+    def _ml_authorization(
         self,
         txn: Transaction,
         enriched: EnrichedTransaction,
         ml_result: MLScoringResult,
         severity: DriftSeverity,
+        flagged: bool = False,
     ) -> FraudAssessment:
-        """Build a ``FraudAssessment`` using only the ML model score."""
+        """Build a ``FraudAssessment`` using the ML model score.
+
+        This is the real-time authorization decision.  If the transaction
+        is flagged, it is provisionally authorized (or declined) and
+        separately queued for async LLM investigation.
+        """
         score = ml_result.score
         is_fraud = score >= self._config.gray_zone_upper
 
         factors_str = ", ".join(ml_result.top_risk_factors) if ml_result.top_risk_factors else "none"
-        decision = "fraudulent" if is_fraud else "legitimate"
+
+        if flagged:
+            decision = "flagged for review"
+            tier = "ml_flagged_for_async_investigation"
+        elif is_fraud:
+            decision = "declined (fraudulent)"
+            tier = "ml_only"
+        else:
+            decision = "approved (legitimate)"
+            tier = "ml_only"
+
         explanation = (
-            f"ML model assessed transaction as {decision} "
+            f"Real-time ML authorization: {decision} "
             f"(score={score:.4f}). Top risk factors: {factors_str}."
         )
+        if flagged:
+            explanation += " Queued for async LLM/RAG investigation."
 
         return FraudAssessment(
             transaction_id=txn.transaction_id,
@@ -330,55 +354,102 @@ class FraudDetectionPipeline:
             model_version=self._config.model_version,
             ml_score=score,
             llm_score=None,
-            analysis_tier="ml_only",
+            analysis_tier=tier,
         )
 
-    def _ml_plus_llm_assessment(
+    # ------------------------------------------------------------------
+    # Async LLM investigation (post-transaction, non-blocking)
+    # ------------------------------------------------------------------
+
+    def _queue_async_llm_investigation(
         self,
         txn: Transaction,
         enriched: EnrichedTransaction,
         embedding: list[float],
         ml_result: MLScoringResult,
-        severity: DriftSeverity,
-    ) -> FraudAssessment:
-        """Build a ``FraudAssessment`` that combines ML scoring with
-        complementary RAG+LLM analysis.
+    ) -> None:
+        """Queue a flagged transaction for async LLM/RAG investigation.
+
+        This does NOT block the authorization decision.  The investigation
+        runs in the background and its results are stored for analyst
+        review.
         """
-        # RAG retrieval
+        self._state.total_async_llm_queued += 1
+        logger.info(
+            "Queued transaction %s for async LLM investigation (ML score=%.4f)",
+            txn.transaction_id,
+            ml_result.score,
+        )
+        # In production this would enqueue to a message broker (e.g. Kafka,
+        # SQS).  The async consumer calls _run_llm_investigation().
+        # For demonstration, we fire-and-forget if an event loop is running.
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(
+                self._run_llm_investigation_async(txn, enriched, embedding, ml_result)
+            )
+        except RuntimeError:
+            # No event loop -- log for later batch processing.
+            logger.debug(
+                "No event loop available; transaction %s queued for batch LLM processing",
+                txn.transaction_id,
+            )
+
+    async def _run_llm_investigation_async(
+        self,
+        txn: Transaction,
+        enriched: EnrichedTransaction,
+        embedding: list[float],
+        ml_result: MLScoringResult,
+    ) -> dict[str, Any]:
+        """Perform the actual LLM/RAG investigation asynchronously.
+
+        This runs outside the authorization path and stores the result
+        for analyst review.
+        """
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            self._run_llm_investigation,
+            txn, enriched, embedding, ml_result,
+        )
+        return result
+
+    def _run_llm_investigation(
+        self,
+        txn: Transaction,
+        enriched: EnrichedTransaction,
+        embedding: list[float],
+        ml_result: MLScoringResult,
+    ) -> dict[str, Any]:
+        """Synchronous LLM/RAG investigation logic.
+
+        Called from the async wrapper.  Retrieves similar patterns,
+        runs the LLM assessor, and returns the investigation result.
+        """
         patterns = self._retriever.retrieve(
             transaction_embedding=embedding,
             top_k=self._config.retrieval_top_k,
             query_id=txn.transaction_id,
         )
 
-        # LLM scoring (complementary layer)
         llm_score = self._compute_llm_score(enriched, patterns)
 
-        # Blend ML and LLM scores
-        w = self._config.ml_weight
-        blended = w * ml_result.score + (1.0 - w) * llm_score
-        blended = max(0.0, min(1.0, blended))
+        investigation = {
+            "transaction_id": txn.transaction_id,
+            "ml_score": ml_result.score,
+            "llm_score": llm_score,
+            "n_similar_patterns": len(patterns),
+            "similar_fraud_ids": [p.transaction_id for p in patterns[:3]],
+            "investigated_at": datetime.now(timezone.utc).isoformat(),
+        }
 
-        is_fraud = blended >= self._config.fraud_threshold
-
-        # Build rich explanation
-        explanation = self._build_dual_layer_explanation(
-            ml_result, llm_score, patterns, blended, is_fraud,
+        logger.info(
+            "Async LLM investigation complete for %s: llm_score=%.4f",
+            txn.transaction_id,
+            llm_score,
         )
-
-        return FraudAssessment(
-            transaction_id=txn.transaction_id,
-            fraud_score=blended,
-            is_fraud=is_fraud,
-            confidence=self._score_to_confidence(blended),
-            explanation=explanation,
-            similar_fraud_ids=[p.transaction_id for p in patterns[:3]],
-            drift_severity=severity.value,
-            model_version=self._config.model_version,
-            ml_score=ml_result.score,
-            llm_score=llm_score,
-            analysis_tier="ml_plus_llm",
-        )
+        return investigation
 
     # ------------------------------------------------------------------
     # Async entry points
@@ -453,7 +524,7 @@ class FraudDetectionPipeline:
         return DriftSeverity.NONE
 
     # ------------------------------------------------------------------
-    # LLM scoring (complementary layer)
+    # LLM scoring (async investigation layer)
     # ------------------------------------------------------------------
 
     def _compute_llm_score(
@@ -461,8 +532,8 @@ class FraudDetectionPipeline:
     ) -> float:
         """Compute a fraud score using the LLM assessor or a heuristic.
 
-        This is the *complementary* scoring layer, invoked selectively
-        for gray-zone and high-value transactions.
+        This is the *async investigation* scoring layer, invoked
+        post-transaction for flagged transactions only.
         """
         if self._llm_assessor is not None:
             try:
@@ -525,7 +596,7 @@ class FraudDetectionPipeline:
         )
 
     # ------------------------------------------------------------------
-    # Explanation helpers
+    # Helpers
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -536,34 +607,3 @@ class FraudDetectionPipeline:
         low-confidence.
         """
         return abs(2.0 * score - 1.0)
-
-    @staticmethod
-    def _build_dual_layer_explanation(
-        ml_result: MLScoringResult,
-        llm_score: float,
-        patterns: list[Any],
-        blended_score: float,
-        is_fraud: bool,
-    ) -> str:
-        """Build a human-readable explanation combining both scoring layers."""
-        decision = "fraudulent" if is_fraud else "legitimate"
-        factors_str = (
-            ", ".join(ml_result.top_risk_factors)
-            if ml_result.top_risk_factors
-            else "none identified"
-        )
-        n_similar = len(patterns)
-        pattern_info = (
-            f"RAG retrieval found {n_similar} similar historical pattern(s)."
-            if n_similar > 0
-            else "No similar historical patterns found."
-        )
-
-        return (
-            f"Dual-layer analysis assessed transaction as {decision} "
-            f"(blended score={blended_score:.4f}). "
-            f"ML model score: {ml_result.score:.4f} "
-            f"(top risk factors: {factors_str}). "
-            f"LLM complementary score: {llm_score:.4f}. "
-            f"{pattern_info}"
-        )

@@ -11,16 +11,18 @@ langsmith:
     - "production-monitoring"
 
   # Custom evaluation metrics reported to LangSmith
+  # MMD is the sole embedding drift metric. See docs/05_drift_metrics_and_thresholds.md
+  # for why cosine distance, KS, Wasserstein, and PSI are inappropriate for dense embeddings.
   custom_metrics:
-    - name: "embedding_cosine_drift"
-      description: "Cosine distance drift from reference distribution"
+    - name: "embedding_mmd_drift"
+      description: "Maximum Mean Discrepancy drift score (RBF kernel, median heuristic)"
       metric_type: "continuous"
       higher_is_worse: true
 
-    - name: "embedding_mmd_drift"
-      description: "Maximum Mean Discrepancy drift score"
+    - name: "embedding_mmd_pvalue"
+      description: "MMD permutation test p-value (lower = more significant drift)"
       metric_type: "continuous"
-      higher_is_worse: true
+      higher_is_worse: false
 
     - name: "retrieval_relevance_degradation"
       description: "Drop in RAG retrieval relevance score correlated with drift"
@@ -32,26 +34,26 @@ langsmith:
       metric_type: "continuous"
       higher_is_worse: false
 
-  # Dashboard panels
+  # Dashboard panels -- all drift detection is MMD-based
   dashboard:
     refresh_interval_seconds: 60
     panels:
-      - title: "Embedding Drift Over Time"
-        metric: "embedding_cosine_drift"
-        chart_type: "time_series"
-        threshold_lines: [0.05, 0.15, 0.30]
-
-      - title: "MMD Two-Sample Test"
+      - title: "MMD Drift Score Over Time"
         metric: "embedding_mmd_drift"
         chart_type: "time_series"
-        threshold_lines: [0.02, 0.08, 0.20]
+        threshold_lines: [0.02, 0.08]
 
-      - title: "Retrieval Quality vs Drift Correlation"
-        metrics: ["embedding_cosine_drift", "retrieval_relevance_degradation"]
+      - title: "MMD Permutation Test P-Value"
+        metric: "embedding_mmd_pvalue"
+        chart_type: "time_series"
+        threshold_lines: [0.01, 0.001]
+
+      - title: "Retrieval Quality vs MMD Drift Correlation"
+        metrics: ["embedding_mmd_drift", "retrieval_relevance_degradation"]
         chart_type: "scatter"
 
-      - title: "Drift by Merchant Category"
-        metric: "embedding_cosine_drift"
+      - title: "MMD Drift by Merchant Category"
+        metric: "embedding_mmd_drift"
         chart_type: "heatmap"
         group_by: "merchant_category_code"
 

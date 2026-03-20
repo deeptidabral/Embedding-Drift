@@ -3,8 +3,6 @@
 from src.visualization.plots import (
     plot_amount_distribution,
     plot_category_fraud_rate,
-    plot_cosine_distance_distribution,
-    plot_cusum_chart,
     plot_drift_heatmap,
     plot_drift_metrics_over_time,
     plot_dual_layer_drift_correlation,
@@ -26,8 +24,6 @@ from src.visualization.schematics import (
 __all__ = [
     "plot_amount_distribution",
     "plot_category_fraud_rate",
-    "plot_cosine_distance_distribution",
-    "plot_cusum_chart",
     "plot_drift_heatmap",
     "plot_drift_metrics_over_time",
     "plot_dual_layer_drift_correlation",

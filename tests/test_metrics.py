@@ -1,9 +1,13 @@
 """
 Comprehensive test suite for src.drift_detection.metrics.
 
-Validates all five drift metric functions against known synthetic
+Validates the MMD drift metric function against known synthetic
 distributions.  Each test uses deterministic random seeds so results
 are reproducible across platforms.
+
+Design rationale: Dense embedding dimensions are highly entangled.
+Only MMD correctly assesses the full high-dimensional distribution.
+See src/drift_detection/metrics.py for the full rationale.
 """
 
 from __future__ import annotations
@@ -12,11 +16,7 @@ import numpy as np
 import pytest
 
 from src.drift_detection.metrics import (
-    cosine_distance_drift,
-    kolmogorov_smirnov_per_component,
     maximum_mean_discrepancy,
-    population_stability_index,
-    wasserstein_distance_drift,
 )
 
 # ---------------------------------------------------------------------------
@@ -40,58 +40,6 @@ def _shifted_embeddings(
     return RNG.standard_normal((n, d)) + shift
 
 
-def _orthogonal_pair(d: int = DIM) -> tuple[np.ndarray, np.ndarray]:
-    """Return two (1, d) arrays that are orthogonal to each other."""
-    a = np.zeros((1, d))
-    b = np.zeros((1, d))
-    a[0, 0] = 1.0
-    b[0, 1] = 1.0
-    return a, b
-
-
-# ===================================================================
-# cosine_distance_drift
-# ===================================================================
-
-
-@pytest.mark.unit
-class TestCosineDistanceDrift:
-    """Tests for cosine distance between embedding distributions."""
-
-    def test_identical_distributions_near_zero(self) -> None:
-        """Identical reference and production sets should yield drift ~ 0."""
-        ref = _standard_embeddings()
-        score = cosine_distance_drift(ref, ref)
-        assert score == pytest.approx(0.0, abs=1e-6)
-
-    def test_orthogonal_embeddings_near_one(self) -> None:
-        """Mutually orthogonal single-sample sets should yield drift ~ 1."""
-        a, b = _orthogonal_pair()
-        score = cosine_distance_drift(a, b)
-        assert score == pytest.approx(1.0, abs=0.05)
-
-    def test_small_shift_below_threshold(self) -> None:
-        """A small additive shift should produce a moderate, nonzero score."""
-        ref = _standard_embeddings()
-        prod = ref + 0.01
-        score = cosine_distance_drift(ref, prod)
-        assert 0.0 < score < 0.5
-
-    def test_large_shift_above_threshold(self) -> None:
-        """A large directional shift should produce a high drift score."""
-        ref = _standard_embeddings()
-        prod = _shifted_embeddings(shift=10.0)
-        score = cosine_distance_drift(ref, prod)
-        assert score > 0.1
-
-    def test_single_sample_does_not_crash(self) -> None:
-        """A single-sample distribution should still return a float."""
-        ref = _standard_embeddings(n=1)
-        prod = _standard_embeddings(n=1)
-        score = cosine_distance_drift(ref, prod)
-        assert isinstance(score, float)
-
-
 # ===================================================================
 # maximum_mean_discrepancy
 # ===================================================================
@@ -105,145 +53,66 @@ class TestMaximumMeanDiscrepancy:
         """MMD between two draws from the same distribution should be near 0."""
         ref = _standard_embeddings(n=400)
         prod = _standard_embeddings(n=400)
-        score = maximum_mean_discrepancy(ref, prod)
-        assert score < 0.05
+        result = maximum_mean_discrepancy(ref, prod)
+        assert result.value < 0.05
 
     def test_different_distributions_large(self) -> None:
         """MMD between well-separated distributions should be large."""
         ref = _standard_embeddings(n=400)
         prod = _shifted_embeddings(shift=5.0, n=400)
-        score = maximum_mean_discrepancy(ref, prod)
-        assert score > 0.1
+        result = maximum_mean_discrepancy(ref, prod)
+        assert result.value > 0.1
 
     def test_score_is_non_negative(self) -> None:
         """MMD is a squared distance and must be non-negative."""
         ref = _standard_embeddings(n=200)
         prod = _standard_embeddings(n=200)
-        score = maximum_mean_discrepancy(ref, prod)
-        assert score >= 0.0
+        result = maximum_mean_discrepancy(ref, prod)
+        assert result.value >= 0.0
 
     def test_high_dimensional_stability(self) -> None:
         """MMD should remain stable in high-dimensional spaces."""
         ref = RNG.standard_normal((200, 512))
         prod = RNG.standard_normal((200, 512)) + 2.0
-        score = maximum_mean_discrepancy(ref, prod)
-        assert isinstance(score, float)
-        assert score > 0.0
+        result = maximum_mean_discrepancy(ref, prod)
+        assert isinstance(result.value, float)
+        assert result.value > 0.0
 
+    def test_p_value_returned(self) -> None:
+        """MMD result should include a permutation p-value."""
+        ref = _standard_embeddings(n=100)
+        prod = _standard_embeddings(n=100)
+        result = maximum_mean_discrepancy(ref, prod)
+        assert result.p_value is not None
+        assert 0.0 <= result.p_value <= 1.0
 
-# ===================================================================
-# kolmogorov_smirnov_per_component
-# ===================================================================
+    def test_significant_drift_detected(self) -> None:
+        """MMD should detect significant drift for well-separated distributions."""
+        ref = _standard_embeddings(n=200)
+        prod = _shifted_embeddings(shift=5.0, n=200)
+        result = maximum_mean_discrepancy(ref, prod)
+        assert result.is_significant is True
 
+    def test_no_drift_not_significant(self) -> None:
+        """MMD should not flag identical distributions as significant."""
+        ref = _standard_embeddings(n=200)
+        result = maximum_mean_discrepancy(ref, ref)
+        assert result.is_significant is False
 
-@pytest.mark.unit
-class TestKolmogorovSmirnovPerComponent:
-    """Tests for per-component KS drift detection."""
+    def test_metric_name(self) -> None:
+        """Result should carry the correct metric name."""
+        ref = _standard_embeddings(n=50)
+        prod = _standard_embeddings(n=50)
+        result = maximum_mean_discrepancy(ref, prod)
+        assert result.metric_name == "mmd"
 
-    def test_same_distribution_low_statistic(self) -> None:
-        """KS statistic for draws from the same distribution should be low."""
-        ref = _standard_embeddings()
-        prod = _standard_embeddings()
-        result = kolmogorov_smirnov_per_component(ref, prod)
-        # result may be a dict or an array; we check the mean statistic
-        if isinstance(result, dict):
-            mean_stat = np.mean(list(result.values()))
-        else:
-            mean_stat = float(np.mean(result))
-        assert mean_stat < 0.15
-
-    def test_shifted_distribution_high_statistic(self) -> None:
-        """Shifting one distribution should raise the KS statistic."""
-        ref = _standard_embeddings()
-        prod = _shifted_embeddings(shift=3.0)
-        result = kolmogorov_smirnov_per_component(ref, prod)
-        if isinstance(result, dict):
-            mean_stat = np.mean(list(result.values()))
-        else:
-            mean_stat = float(np.mean(result))
-        assert mean_stat > 0.3
-
-    def test_returns_per_component_values(self) -> None:
-        """Result should contain one statistic per embedding dimension."""
-        ref = _standard_embeddings(d=8)
-        prod = _standard_embeddings(d=8)
-        result = kolmogorov_smirnov_per_component(ref, prod)
-        if isinstance(result, dict):
-            assert len(result) == 8
-        else:
-            assert len(result) == 8
-
-
-# ===================================================================
-# wasserstein_distance_drift
-# ===================================================================
-
-
-@pytest.mark.unit
-class TestWassersteinDistanceDrift:
-    """Tests for the Wasserstein (earth mover) distance metric."""
-
-    def test_same_distribution_near_zero(self) -> None:
-        """Wasserstein distance between identical arrays should be 0."""
-        ref = _standard_embeddings()
-        score = wasserstein_distance_drift(ref, ref)
-        assert score == pytest.approx(0.0, abs=1e-6)
-
-    def test_known_shift_produces_proportional_distance(self) -> None:
-        """Shifting all embeddings by a constant should increase the score."""
-        ref = _standard_embeddings()
-        small_shift = ref + 0.5
-        large_shift = ref + 5.0
-        score_small = wasserstein_distance_drift(ref, small_shift)
-        score_large = wasserstein_distance_drift(ref, large_shift)
-        assert score_large > score_small > 0.0
-
-    def test_single_sample(self) -> None:
-        """Function should handle single-sample inputs gracefully."""
-        ref = _standard_embeddings(n=1)
-        prod = _shifted_embeddings(shift=1.0, n=1)
-        score = wasserstein_distance_drift(ref, prod)
-        assert isinstance(score, float)
-        assert score >= 0.0
-
-
-# ===================================================================
-# population_stability_index
-# ===================================================================
-
-
-@pytest.mark.unit
-class TestPopulationStabilityIndex:
-    """Tests for the Population Stability Index metric."""
-
-    def test_identical_distributions_zero(self) -> None:
-        """PSI of a distribution against itself should be near 0."""
-        ref = _standard_embeddings()
-        score = population_stability_index(ref, ref)
-        assert score == pytest.approx(0.0, abs=1e-4)
-
-    def test_shifted_distribution_positive(self) -> None:
-        """Shifting the distribution should produce a positive PSI."""
-        ref = _standard_embeddings()
-        prod = _shifted_embeddings(shift=2.0)
-        score = population_stability_index(ref, prod)
-        assert score > 0.10
-
-    def test_psi_is_non_negative(self) -> None:
-        """PSI must be non-negative by definition."""
-        ref = _standard_embeddings()
-        prod = _standard_embeddings()
-        score = population_stability_index(ref, prod)
-        assert score >= 0.0
-
-    def test_moderate_shift_in_warning_band(self) -> None:
-        """A moderate shift should fall in the warning band (0.10 - 0.20)."""
-        ref = _standard_embeddings(n=2000)
-        prod = ref + 0.3
-        score = population_stability_index(ref, prod)
-        # We only assert it is meaningfully positive -- exact band depends on
-        # implementation binning strategy.
-        assert score > 0.0
+    def test_linear_kernel(self) -> None:
+        """MMD with linear kernel should also work."""
+        ref = _standard_embeddings(n=100)
+        prod = _shifted_embeddings(shift=3.0, n=100)
+        result = maximum_mean_discrepancy(ref, prod, kernel="linear")
+        assert result.value > 0.0
+        assert result.details.get("kernel") == 1.0
 
 
 # ===================================================================
@@ -253,14 +122,12 @@ class TestPopulationStabilityIndex:
 
 @pytest.mark.unit
 class TestEdgeCases:
-    """Cross-cutting edge cases that apply to all metrics."""
+    """Cross-cutting edge cases for the MMD metric."""
 
     def test_empty_array_raises(self) -> None:
-        """All metrics should raise for empty input arrays."""
+        """MMD should raise for empty input arrays."""
         empty = np.empty((0, DIM))
         ref = _standard_embeddings(n=10)
-        with pytest.raises((ValueError, IndexError)):
-            cosine_distance_drift(empty, ref)
         with pytest.raises((ValueError, IndexError)):
             maximum_mean_discrepancy(empty, ref)
 
@@ -269,13 +136,19 @@ class TestEdgeCases:
         a = _standard_embeddings(d=32)
         b = _standard_embeddings(d=64)
         with pytest.raises((ValueError, IndexError)):
-            cosine_distance_drift(a, b)
+            maximum_mean_discrepancy(a, b)
+
+    def test_single_sample_raises(self) -> None:
+        """Single-sample distributions should raise ValueError (need >= 2)."""
+        ref = _standard_embeddings(n=1)
+        prod = _standard_embeddings(n=10)
+        with pytest.raises(ValueError):
+            maximum_mean_discrepancy(ref, prod)
 
     def test_very_high_dimensional(self) -> None:
-        """Metrics should work in very high-dimensional spaces (d=3072)."""
+        """MMD should work in very high-dimensional spaces (d=3072)."""
         ref = RNG.standard_normal((50, 3072))
         prod = RNG.standard_normal((50, 3072)) + 1.0
-        score_cos = cosine_distance_drift(ref, prod)
-        score_wass = wasserstein_distance_drift(ref, prod)
-        assert isinstance(score_cos, float)
-        assert isinstance(score_wass, float)
+        result = maximum_mean_discrepancy(ref, prod)
+        assert isinstance(result.value, float)
+        assert result.value > 0.0

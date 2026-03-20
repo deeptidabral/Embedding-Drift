@@ -22,15 +22,15 @@ Real-time fraud detection at global payment processors increasingly relies on tw
 ## 1: Problem Statement
 
 - Payment processors, card networks and issuers handle millions of daily transactions worldwide.
-- Every transaction scoring and processing is a low-latency workflow where the core ML model (a bagging or boosting model) scores every transaction in milliseconds, providing clear decisions (approvals and declines).
-- A significant fraction of transactions falling into a gray zone (score 0.3-0.7) imply that the model is uncertain in this zone, or are large (above >= $10K), or require explainability for stakeholders such as auditors and investigators.
-- For these cases, a RAG+LLM layer can retrieve historical fraud patterns from a vector database, perform pattern matching, and synthesize contextual risk assessments with full documented reasoning.
+- Every transaction scoring and processing is a low-latency workflow where the core ML model (XGBoost/LightGBM) scores every transaction in sub-10ms, providing clear authorization decisions (approvals and declines). Payment processors operate under sub-50ms to sub-100ms latency SLAs for authorization, so the ML model alone drives the real-time decision.
+- A significant fraction of transactions fall into a gray zone (score 0.3-0.7) where the model is uncertain, or are large (above >= $10K), or require explainability for stakeholders such as auditors and investigators. These transactions are flagged for manual review by human analysts.
+- A RAG+LLM layer operates **asynchronously, after the authorization decision**, to support post-transaction investigation. It retrieves historical fraud patterns from a vector database, performs pattern matching, and synthesizes contextual risk assessments with full documented reasoning. The LLM never blocks a transaction decision. It assists human analysts in reviewing flagged cases, generates explainability reports for audit compliance, supports chargeback defense, and produces regulatory audit documentation.
 
 **Why drift monitoring matters:**
 
-- Silent performance (% of correct fraud detection and decline): Reporting dashboards could stay green, latency be normal, error rates are flat, but decisions get worse
-- Embedding drift in the RAG layer causes retrieval quality to degrade, feeding the LLM lower-quality context
-- Feature drift in the ML model (covariate shift, concept drift, target shift) erodes primary scoring accuracy
+- Silent performance degradation: Reporting dashboards could stay green, latency be normal, error rates are flat, but decisions get worse
+- Feature drift in the ML model (covariate shift, concept drift, target shift) erodes primary scoring accuracy, directly impacting real-time authorization quality
+- Embedding drift in the RAG layer causes retrieval quality to degrade, feeding the LLM lower-quality context for post-transaction investigation. This leads to degraded investigation quality, missed fraud in manual review queues, weaker chargeback defense, and unreliable audit documentation
 - Undetected false negatives can cost tens of millions per fraud ring; false positives cost the industry an estimated $440B+ annually in declined legitimate transactions
 - Under PCI DSS and SOX, undetected drift in either layer is a control failure
 
@@ -43,6 +43,7 @@ This repository provides approaches for detection theory, statistical tooling, m
 ### Topic 1: Embeddings Fundamentals
 - How raw transaction data (merchant codes, amounts, geolocation, temporal features) is transformed into dense vectors for the RAG layer
 - How those embeddings enable retrieval of similar historical fraud patterns for LLM-based analysis
+- **Important note on embedding approach:** This project uses text embedding models (sentence-transformers) as a simplified demonstration of drift monitoring concepts. Text embeddings are not the right tool for encoding structured tabular transaction data (amounts, MCCs, coordinates) in production -- they are poor at capturing numerical magnitudes and geospatial relationships. Production fraud detection systems use Deep Entity Embeddings, Autoencoders, or Graph Neural Networks (GNNs) to embed tabular transaction entities. The drift monitoring framework demonstrated here applies equally to any embedding type.
 - See: `docs/01_embeddings_fundamentals.md`
 
 ### Topic 2: Embedding Drift Theory
@@ -56,8 +57,8 @@ This repository provides approaches for detection theory, statistical tooling, m
 - See: `docs/03_why_monitor_drift.md`
 
 ### Topic 4: Monitoring with LangSmith
-- LangSmith as the observability backend for the RAG+LLM layer
-- How LLM transaction assessments are traced, drift metrics posted as feedback scores, and dashboard displays drift trends alongside retrieval quality
+- LangSmith as the observability backend for the async RAG+LLM investigation pipeline (not the real-time authorization path)
+- How post-transaction LLM investigation runs are traced, drift metrics posted as feedback scores, and dashboard displays drift trends alongside investigation quality
 - See: `docs/04_monitoring_with_langsmith.md`
 
 ### Topic 5: Drift Metrics and Thresholds
@@ -76,31 +77,45 @@ This repository provides approaches for detection theory, statistical tooling, m
 
 ### Dual-Layer Fraud Detection Pipeline
 
-- Every transaction is scored by the ML model first (XGBoost, sub-10ms)
-- A Decision Router determines whether the RAG+LLM layer is needed:
+- Every transaction is scored by the ML model first (XGBoost, sub-10ms). The ML model alone drives the real-time authorization decision within the payment processor's sub-50ms latency SLA.
+- A Decision Router determines the authorization outcome and whether post-transaction investigation is needed:
   - **Clear decisions (score < 0.3 or > 0.7):** Approved or declined on ML score alone
-  - **Gray zone (score 0.3-0.7):** Routed to RAG+LLM for deeper analysis
-  - **High-value (> $10K):** Always routed to RAG+LLM regardless of score
-  - **Explainability / novel pattern detection:** Routed to RAG+LLM for reasoning and audit trails
-- Roughly 20-30% of transactions invoke the RAG+LLM layer; the rest are handled by ML alone
+  - **Gray zone (score 0.3-0.7):** Authorized based on ML score (with conservative thresholds), then flagged for manual review
+  - **High-value (> $10K):** Authorized based on ML score, then flagged for post-transaction investigation regardless of score
+- The RAG+LLM layer operates **asynchronously after authorization**. It processes flagged transactions to assist human analysts in manual review queues, generate explainability reports, support chargeback defense, and produce regulatory audit documentation. LLM API calls take hundreds of milliseconds to seconds, making them incompatible with real-time authorization latency requirements.
 
 ### Decision Flow
 
 ```
-Transaction -> ML Model (XGBoost) -> fraud_score -> Decision Router
-                                                        |
-                          +-----------------------------+-----------------------------+
+                    REAL-TIME AUTHORIZATION PATH (sub-50ms SLA)
+                    ============================================
+
+Transaction -> ML Model (XGBoost, sub-10ms) -> fraud_score -> Decision Router
+                                                                   |
+                          +----------------------------------------+------------------+
                           |                                                           |
-                   Clear decision                                         Gray zone / High value /
-                   (score < 0.3 or > 0.7)                                 Explainability needed
-                          |                                                           |
-                          v                                                           v
-                   Final Decision                                         RAG+LLM Complement
-                   (approve/decline)                                      (retrieve + assess)
+                   Clear decision                                         Gray zone / High value
+                   (score < 0.3 or > 0.7)                                            |
+                          |                                                           v
+                          v                                              Authorization decision
+                   Authorization decision                                (approve/decline with
+                   (approve/decline)                                      conservative thresholds)
                                                                                       |
                                                                                       v
-                                                                               Final Decision
-                                                                         (with reasoning + audit trail)
+                                                                         Flag for manual review
+                                                                                      |
+    - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - +- -
+                                                                                      |
+                    ASYNC INVESTIGATION PATH (no latency SLA)                         |
+                    ==========================================                        |
+                                                                                      v
+                                                                         Async queue -> RAG+LLM
+                                                                         (retrieve + assess)
+                                                                                      |
+                                                                                      v
+                                                                         Investigation report
+                                                                         (reasoning, audit trail,
+                                                                          analyst recommendations)
 ```
 
 ### Drift Monitoring Plane
@@ -291,6 +306,8 @@ pip install -r requirements.txt
 
 **Note:** The project runs fully locally with no API keys required. The default embedding model is sentence-transformers (all-MiniLM-L6-v2), which runs on your machine at no cost. To use OpenAI text-embedding-3-large as an optional production backend, set the `OPENAI_API_KEY` environment variable and update the configuration accordingly.
 
+**Note on embedding approach:** This project uses text embedding models (sentence-transformers) as a simplified demonstration of drift monitoring concepts. In production, structured tabular transaction data (amounts, MCCs, coordinates) would be embedded using Deep Entity Embeddings, Autoencoders, or Graph Neural Networks (GNNs), which properly capture numerical magnitudes and geospatial relationships. The drift monitoring framework and statistical methods demonstrated here transfer directly to any embedding type.
+
 ### Download the Sparkov Dataset
 
 The project uses the Sparkov Credit Card Fraud Detection dataset (1.8M simulated transactions). Download it via the Kaggle CLI:
@@ -393,10 +410,10 @@ python examples/drift_monitoring_demo.py
 | ML Scoring Model       | XGBoost, scikit-learn                         | Primary fraud probability scoring for all transactions |
 | Embedding Models       | sentence-transformers (all-MiniLM-L6-v2), OpenAI text-embedding-3-large (optional) | Transaction text to vector conversion for RAG layer |
 | Vector Database        | ChromaDB                                      | Storage and retrieval of transaction embeddings    |
-| LLM Inference          | GPT-4o                                        | Complementary fraud assessment for gray zone and high-value transactions |
+| LLM Inference          | GPT-4o                                        | Async post-transaction investigation, analyst co-pilot for manual review, chargeback defense, and audit documentation |
 | Statistical Computing  | NumPy, SciPy, scikit-learn                    | Drift detection computations for both layers       |
 | Drift Monitoring       | Evidently AI, alibi-detect                    | Statistical drift reports and advanced detection   |
-| LLM Observability      | LangSmith                                     | RAG+LLM tracing, evaluation, and dashboards        |
+| LLM Observability      | LangSmith                                     | Async investigation pipeline tracing, evaluation, and dashboards |
 | Alerting               | PagerDuty, Slack webhooks                     | Drift alert delivery                               |
 | Data Processing        | Pandas                                        | Transaction data manipulation and feature engineering |
 | Visualization          | Matplotlib, Seaborn                           | Embedding space, drift metrics, and pipeline visualization |

@@ -2,9 +2,10 @@
 
 ## Overview
 
-- A dual-layer fraud detection architecture pairs a primary ML model (XGBoost or similar) for real-time scoring with a RAG+LLM complement layer for gray zone cases, high-value transactions, explainability, and novel pattern detection.
-- Embeddings are the computational foundation of the complement layer. They determine retrieval quality for the hardest, highest-stakes decisions.
-- This document covers what embeddings are, how transaction data is encoded, key geometric properties, and why embedding quality matters disproportionately for cases the ML model cannot resolve alone.
+- A dual-layer fraud detection architecture pairs a primary ML model (XGBoost or similar) for real-time authorization scoring (sub-10ms) with an async RAG+LLM investigation layer for post-transaction analysis of flagged transactions, manual review support, chargeback defense, and regulatory audit documentation. The LLM never blocks a transaction authorization decision.
+- Embeddings are the computational foundation of the investigation layer. They determine retrieval quality for the post-transaction analysis of the hardest, highest-stakes cases.
+- This document covers what embeddings are, how transaction data is encoded, key geometric properties, and why embedding quality matters disproportionately for investigation of cases the ML model cannot resolve alone.
+- **Important:** This project uses text embedding models as a simplified demonstration of drift monitoring concepts. Production fraud detection systems embed structured tabular data using Deep Entity Embeddings, Autoencoders, or Graph Neural Networks (see the "Limitations of Text Embeddings for Tabular Transaction Data" section below).
 
 ---
 
@@ -388,8 +389,37 @@ This project uses the Sparkov Credit Card Fraud Detection dataset as its primary
 
 ---
 
+## Limitations of Text Embeddings for Tabular Transaction Data
+
+Text embedding models (sentence-transformers, OpenAI text-embedding-3-large, and similar NLP models) are designed for natural language and are not the right tool for embedding structured tabular transaction data in production. Key limitations include:
+
+- **Numerical magnitudes:** NLP models tokenize numbers as character sequences, not as continuous values. The difference between "$50" and "$5,000" is not encoded proportionally. A text embedding model has no concept of numerical scale -- it treats "$100" and "$10,000" as sequences of characters that happen to share some tokens, not as quantities with a 100x difference.
+- **Geospatial relationships:** Latitude/longitude pairs serialized as text do not encode actual geographic distance. Two transactions 5 miles apart and two transactions 500 miles apart may produce similar cosine distances in text embedding space because the model has no geometric understanding of coordinates.
+- **Structured feature interactions:** Transaction fraud signals often depend on interactions between structured features (e.g., transaction amount relative to cardholder average spend, velocity patterns, MCC-amount combinations). Text serialization flattens these into natural language, losing the structured relationships that purpose-built models preserve.
+
+### Production Embedding Approaches
+
+Production fraud detection systems use embedding architectures designed for structured tabular data:
+
+| Approach | What It Does | Strengths |
+|---|---|---|
+| Deep Entity Embeddings | Learns dense vector representations for categorical entities (merchants, MCCs, cardholders) through a supervised neural network | Captures entity co-occurrence patterns; handles high-cardinality categoricals |
+| Autoencoders | Learns compressed latent representations of transaction feature vectors through reconstruction | Preserves numerical relationships; anomaly detection via reconstruction error |
+| Graph Neural Networks (GNNs) | Embeds entities (cardholders, merchants, devices) as nodes in a transaction graph, learning representations from graph structure | Captures network-level fraud signals (fraud rings, shared devices, money mules) |
+
+Text embedding models remain appropriate for unstructured text fields that arise in fraud workflows: merchant names (fuzzy matching for shell companies), dispute reasoning text, investigation notes, and regulatory documentation.
+
+### This Project's Approach
+
+This project uses text embeddings (sentence-transformers all-MiniLM-L6-v2) as a **simplified demonstration** of drift monitoring concepts. The choice is deliberate: text embeddings are easy to generate locally with no API keys, the Sparkov dataset is readily available, and the drift monitoring framework is the focus -- not the embedding architecture.
+
+The drift monitoring framework, statistical methods (MMD, KS, cosine distance, PSI), threshold selection, alerting infrastructure, and mitigation strategies demonstrated here apply equally to any embedding type. In production, the same monitoring pipeline would wrap entity embeddings, autoencoder latent vectors, or GNN node embeddings, with the same drift detection mathematics.
+
+---
+
 ## Summary
 
-- Embeddings power the RAG complement layer, the safety net for gray zone, high-value, and explainability-required transactions.
-- Embedding quality directly determines retrieval quality, which determines whether the complement layer adds signal or noise.
+- Embeddings power the RAG investigation layer, supporting post-transaction analysis for flagged, high-value, and explainability-required transactions.
+- Embedding quality directly determines retrieval quality, which determines whether the investigation layer provides useful context to human analysts or noise.
 - Understanding how embeddings encode transaction data and what geometric properties they depend on is prerequisite to understanding how drift degrades them.
+- This project uses text embeddings as a demonstration of drift monitoring concepts. Production systems should use entity embeddings, autoencoders, or GNNs for structured tabular data. The drift monitoring framework transfers directly to any embedding type.

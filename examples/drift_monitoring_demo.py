@@ -1,22 +1,28 @@
 """
-Drift Monitoring Demo -- End-to-end example of embedding drift detection
-for a dual-layer fraud detection system (ML model + RAG+LLM).
+Drift Monitoring Demo -- End-to-end example of MMD-based embedding drift
+detection for a fraud detection system.
 
 This script walks through the complete monitoring workflow:
 
     1. Create a reference embedding distribution (simulating a trained model).
-    2. Compute all five drift metrics against a production window.
-    3. Run the ensemble drift detector with configurable agreement logic.
+    2. Compute MMD against a production window.
+    3. Run the drift detector with severity classification.
     4. Simulate gradual drift over multiple time windows.
     5. Show how alerts fire at different severity levels.
     6. Demonstrate monitoring of both ML feature drift and RAG embedding drift.
-    7. Show how drift in the RAG layer affects gray zone analysis quality.
+    7. Show how drift in the RAG layer affects investigation quality.
 
-In the dual-layer architecture:
-  - ML feature drift degrades the primary scorer, affecting ALL transactions.
-  - RAG embedding drift degrades pattern retrieval, affecting gray zone and
-    high-value transactions that are escalated to the LLM layer.
-  - Monitoring both drift types provides comprehensive pipeline health.
+Architecture:
+  - ML model runs in the real-time authorization path (synchronous).
+  - LLM/RAG investigation runs ASYNCHRONOUSLY for flagged transactions.
+  - Drift is monitored using MMD only (the sole metric -- see design note).
+
+Design note on drift detection:
+  Dense embedding dimensions are highly entangled.  Univariate tests
+  (KS per dimension) suffer from massive multiple-testing problems and
+  miss multivariate rotations.  Cosine distance only captures mean
+  shift.  PCA explained-variance comparisons miss mean shift entirely.
+  Only MMD correctly assesses the full high-dimensional distribution.
 
 All data is synthetic.  No external services are required.
 
@@ -71,38 +77,14 @@ def _transaction_to_text(row: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Configuration (mirrors configs/drift_thresholds.yaml)
+# Configuration -- MMD thresholds only
 # ---------------------------------------------------------------------------
 
-THRESHOLDS: dict[str, dict[str, float]] = {
-    "cosine_distance": {
-        "nominal_upper": 0.05,
-        "warning_upper": 0.15,
-        "critical_upper": 0.30,
-    },
-    "maximum_mean_discrepancy": {
-        "nominal_upper": 0.02,
-        "warning_upper": 0.08,
-        "critical_upper": 0.20,
-    },
-    "kolmogorov_smirnov": {
-        "nominal_upper": 0.05,
-        "warning_upper": 0.12,
-        "critical_upper": 0.25,
-    },
-    "wasserstein_distance": {
-        "nominal_upper": 0.03,
-        "warning_upper": 0.10,
-        "critical_upper": 0.22,
-    },
-    "population_stability_index": {
-        "nominal_upper": 0.10,
-        "warning_upper": 0.20,
-        "critical_upper": 0.35,
-    },
+MMD_THRESHOLDS: dict[str, float] = {
+    "nominal_upper": 0.02,
+    "warning_upper": 0.08,
+    "critical_upper": 0.20,
 }
-
-MIN_METRICS_AGREEING = 2
 
 # ---------------------------------------------------------------------------
 # Data generation -- real embeddings from Sparkov when available
@@ -148,7 +130,6 @@ def _load_sparkov_embeddings() -> tuple[np.ndarray | None, np.ndarray | None]:
     prod_df = df.iloc[split_idx:]
 
     # Sample to target sizes
-    rng = np.random.default_rng(42)
     ref_sample = ref_df.sample(n=min(N_REF, len(ref_df)), random_state=42)
     prod_sample = prod_df.sample(n=min(N_PROD, len(prod_df)), random_state=42)
 
@@ -207,11 +188,7 @@ N_ML_FEATURES = 12  # matches FEATURE_COLUMNS in ml_scorer.py
 def create_ml_reference_features(
     n: int = N_REF, d: int = N_ML_FEATURES, seed: int = 10
 ) -> np.ndarray:
-    """Generate reference ML feature distributions.
-
-    Each column represents one of the 12 features used by the XGBoost
-    model (amount, channel encoding, country risk, etc.).
-    """
+    """Generate reference ML feature distributions."""
     rng = np.random.default_rng(seed)
     return rng.standard_normal((n, d))
 
@@ -228,20 +205,10 @@ def create_ml_production_features(
 
 
 # ---------------------------------------------------------------------------
-# Metric implementations (simplified, self-contained versions)
+# MMD metric (simplified, self-contained version for this demo)
 # ---------------------------------------------------------------------------
 
-def cosine_distance_drift(ref: np.ndarray, prod: np.ndarray) -> float:
-    """Mean cosine distance between reference and production centroids."""
-    ref_centroid = ref.mean(axis=0)
-    prod_centroid = prod.mean(axis=0)
-    cos_sim = np.dot(ref_centroid, prod_centroid) / (
-        np.linalg.norm(ref_centroid) * np.linalg.norm(prod_centroid) + 1e-10
-    )
-    return float(1.0 - cos_sim)
-
-
-def maximum_mean_discrepancy(ref: np.ndarray, prod: np.ndarray) -> float:
+def compute_mmd(ref: np.ndarray, prod: np.ndarray) -> float:
     """Simplified MMD with RBF kernel using the median heuristic."""
     from scipy.spatial.distance import cdist
 
@@ -262,101 +229,34 @@ def maximum_mean_discrepancy(ref: np.ndarray, prod: np.ndarray) -> float:
     return float(max(k_rr + k_pp - 2 * k_rp, 0.0))
 
 
-def kolmogorov_smirnov_mean(ref: np.ndarray, prod: np.ndarray) -> float:
-    """Mean KS statistic across all embedding components."""
-    from scipy.stats import ks_2samp
-
-    stats = []
-    for j in range(ref.shape[1]):
-        stat, _ = ks_2samp(ref[:, j], prod[:, j])
-        stats.append(stat)
-    return float(np.mean(stats))
-
-
-def wasserstein_distance_drift(ref: np.ndarray, prod: np.ndarray) -> float:
-    """Mean 1D Wasserstein distance across embedding components."""
-    from scipy.stats import wasserstein_distance as wd
-
-    dists = []
-    for j in range(ref.shape[1]):
-        dists.append(wd(ref[:, j], prod[:, j]))
-    return float(np.mean(dists))
-
-
-def population_stability_index(
-    ref: np.ndarray, prod: np.ndarray, n_bins: int = 20
-) -> float:
-    """PSI averaged over embedding components."""
-    psi_total = 0.0
-    for j in range(ref.shape[1]):
-        # Determine bin edges from reference
-        edges = np.histogram_bin_edges(ref[:, j], bins=n_bins)
-        ref_counts = np.histogram(ref[:, j], bins=edges)[0].astype(float)
-        prod_counts = np.histogram(prod[:, j], bins=edges)[0].astype(float)
-        # Avoid division by zero
-        ref_frac = (ref_counts + 1e-6) / ref_counts.sum()
-        prod_frac = (prod_counts + 1e-6) / prod_counts.sum()
-        psi_total += float(np.sum((prod_frac - ref_frac) * np.log(prod_frac / ref_frac)))
-    return psi_total / ref.shape[1]
-
-
 # ---------------------------------------------------------------------------
-# Ensemble detector
+# Severity classification
 # ---------------------------------------------------------------------------
 
-def classify_severity(value: float, thresholds: dict[str, float]) -> str:
-    """Map a metric value to a severity level using the threshold config."""
-    if value <= thresholds["nominal_upper"]:
+def classify_severity(mmd_value: float) -> str:
+    """Map an MMD value to a severity level."""
+    if mmd_value <= MMD_THRESHOLDS["nominal_upper"]:
         return "nominal"
-    elif value <= thresholds["warning_upper"]:
+    elif mmd_value <= MMD_THRESHOLDS["warning_upper"]:
         return "warning"
-    elif value <= thresholds["critical_upper"]:
-        return "critical"
     else:
         return "critical"
 
 
-def run_ensemble_detector(
+def run_drift_detector(
     ref: np.ndarray,
     prod: np.ndarray,
-    min_agreeing: int = MIN_METRICS_AGREEING,
 ) -> dict[str, Any]:
-    """Run all five metrics and apply ensemble voting logic.
+    """Run MMD and classify severity.
 
-    Returns a dict with per-metric scores, per-metric severities,
-    and the overall ensemble severity.
+    Returns a dict with the MMD score, severity, and timestamp.
     """
-    scores = {
-        "cosine_distance": cosine_distance_drift(ref, prod),
-        "maximum_mean_discrepancy": maximum_mean_discrepancy(ref, prod),
-        "kolmogorov_smirnov": kolmogorov_smirnov_mean(ref, prod),
-        "wasserstein_distance": wasserstein_distance_drift(ref, prod),
-        "population_stability_index": population_stability_index(ref, prod),
-    }
-
-    severities = {
-        name: classify_severity(val, THRESHOLDS[name])
-        for name, val in scores.items()
-    }
-
-    # Count how many metrics vote for each severity level
-    severity_counts: dict[str, int] = {"nominal": 0, "warning": 0, "critical": 0}
-    for sev in severities.values():
-        severity_counts[sev] += 1
-
-    # Determine overall severity: highest level with enough agreement
-    if severity_counts["critical"] >= min_agreeing:
-        overall = "critical"
-    elif severity_counts["warning"] >= min_agreeing:
-        overall = "warning"
-    else:
-        overall = "nominal"
+    mmd_value = compute_mmd(ref, prod)
+    severity = classify_severity(mmd_value)
 
     return {
-        "scores": scores,
-        "severities": severities,
-        "severity_counts": severity_counts,
-        "overall_severity": overall,
+        "mmd": mmd_value,
+        "severity": severity,
         "timestamp": datetime.now(tz=timezone.utc).isoformat(),
     }
 
@@ -401,17 +301,14 @@ def print_report(report: dict[str, Any], window_label: str, layer: str = "") -> 
     print(f"\n{'=' * 64}")
     print(f"  DRIFT REPORT{layer_tag} -- {window_label}")
     print(f"{'=' * 64}")
-    print(f"  Overall Severity: {report['overall_severity'].upper()}")
+    print(f"  Overall Severity: {report['severity'].upper()}")
     print(f"  Timestamp       : {report['timestamp']}")
     print()
     print(f"  {'Metric':<35s} {'Score':>8s}  {'Severity':>8s}")
     print(f"  {'-' * 53}")
-    for name in report["scores"]:
-        score = report["scores"][name]
-        sev = report["severities"][name]
-        print(f"  {name:<35s} {score:>8.4f}  {sev:>8s}")
+    print(f"  {'maximum_mean_discrepancy':<35s} {report['mmd']:>8.4f}  {report['severity']:>8s}")
     print()
-    simulate_alert(report["overall_severity"])
+    simulate_alert(report["severity"])
     print(f"{'=' * 64}\n")
 
 
@@ -437,21 +334,21 @@ def print_dual_layer_impact(
 
     if rag_severity == "critical":
         print("  [!] RAG embedding drift is critical.")
-        print("      -> Gray zone and high-value LLM analyses are unreliable.")
+        print("      -> Async LLM investigations are unreliable.")
         print("      -> Pattern retrieval is returning stale/irrelevant results.")
     elif rag_severity == "warning":
         print("  [*] RAG embeddings showing moderate drift.")
-        print("      -> Gray zone analysis quality may be reduced.")
+        print("      -> Async investigation quality may be reduced.")
         print("      -> Consider refreshing the pattern knowledge base.")
     else:
-        print("  [ok] RAG embeddings are stable; LLM analysis is reliable.")
+        print("  [ok] RAG embeddings are stable; async LLM investigation is reliable.")
 
     # Interaction effects
     if ml_severity in ("warning", "critical") and rag_severity in ("warning", "critical"):
         print()
         print("  [!!] COMPOUND DRIFT: Both layers are drifting simultaneously.")
         print("       -> More transactions fall into the gray zone due to ML drift,")
-        print("          AND the LLM layer that handles them is also degraded.")
+        print("          AND the async LLM layer that investigates them is also degraded.")
         print("       -> This is the highest-risk scenario for the pipeline.")
     print()
 
@@ -464,18 +361,24 @@ def main() -> None:
     """Simulate gradual drift across both the ML feature space and
     the RAG embedding space, showing their interaction."""
     print()
-    print("Dual-Layer Drift Monitoring Demo")
-    print("Monitoring ML feature drift AND RAG embedding drift")
+    print("MMD-Based Drift Monitoring Demo")
+    print("Monitoring ML feature drift AND RAG embedding drift using MMD")
     print("-" * 64)
+    print()
+    print("Architecture:")
+    print("  ML model  -> synchronous authorization (approve / decline / flag)")
+    print("  LLM/RAG   -> async post-transaction investigation (flagged txns only)")
+    print("  Drift     -> MMD-based monitoring (sole metric)")
+    print()
 
     if _USE_REAL_EMBEDDINGS:
-        print("\nUsing real sentence-transformer embeddings (all-MiniLM-L6-v2, 384 dims).")
+        print("Using real sentence-transformer embeddings (all-MiniLM-L6-v2, 384 dims).")
         if _SPARKOV_TRAIN_PATH.exists():
             print(f"Sparkov data found at {_SPARKOV_TRAIN_PATH}.")
         else:
             print("Sparkov data not found; using random text for real embeddings.")
     else:
-        print("\nFalling back to synthetic random vectors (install sentence-transformers for real embeddings).")
+        print("Falling back to synthetic random vectors (install sentence-transformers for real embeddings).")
 
     # Create reference distributions for both layers
     rag_ref = create_reference_distribution()
@@ -488,20 +391,20 @@ def main() -> None:
     ml_reports: list[dict[str, Any]] = []
 
     # ---------------------------------------------------------------------------
-    # Part 1: RAG embedding drift (same as original demo)
+    # Part 1: RAG embedding drift
     # ---------------------------------------------------------------------------
     print()
     print("=" * 64)
-    print("  PART 1: RAG Embedding Drift Over Time")
+    print("  PART 1: RAG Embedding Drift Over Time (MMD)")
     print("=" * 64)
-    print("  (Affects gray zone and high-value transaction analysis)")
+    print("  (Affects async LLM investigation for flagged transactions)")
 
     shift_schedule = [0.0, 0.2, 0.5, 1.0, 1.8, 2.5]
 
     for step, shift in enumerate(shift_schedule):
         window_label = f"Window {step + 1} / {len(shift_schedule)}  (shift={shift:.1f})"
         prod = create_production_window(shift=shift, seed=step + 100)
-        report = run_ensemble_detector(rag_ref, prod)
+        report = run_drift_detector(rag_ref, prod)
         report["_shift"] = shift
         rag_reports.append(report)
         print_report(report, window_label, layer="RAG Embeddings")
@@ -511,16 +414,16 @@ def main() -> None:
     # ---------------------------------------------------------------------------
     print()
     print("=" * 64)
-    print("  PART 2: ML Feature Drift Over Time")
+    print("  PART 2: ML Feature Drift Over Time (MMD)")
     print("=" * 64)
-    print("  (Affects ALL transaction scoring)")
+    print("  (Affects ALL transaction scoring in the authorization path)")
 
     ml_shift_schedule = [0.0, 0.3, 0.8, 1.5]
 
     for step, shift in enumerate(ml_shift_schedule):
         window_label = f"Window {step + 1} / {len(ml_shift_schedule)}  (shift={shift:.1f})"
         ml_prod = create_ml_production_features(shift=shift, seed=step + 200)
-        report = run_ensemble_detector(ml_ref, ml_prod)
+        report = run_drift_detector(ml_ref, ml_prod)
         report["_shift"] = shift
         ml_reports.append(report)
         print_report(report, window_label, layer="ML Features")
@@ -537,7 +440,7 @@ def main() -> None:
     interaction_scenarios = [
         # (ml_shift, rag_shift, description)
         (0.0, 0.0, "Baseline: both layers stable"),
-        (0.0, 1.5, "RAG drift only: LLM analysis degrades"),
+        (0.0, 1.5, "RAG drift only: async LLM investigation degrades"),
         (1.0, 0.0, "ML drift only: primary scorer degrades"),
         (1.0, 1.5, "Compound drift: both layers degraded"),
     ]
@@ -549,12 +452,12 @@ def main() -> None:
         ml_prod = create_ml_production_features(shift=ml_shift, seed=300)
         rag_prod = create_production_window(shift=rag_shift, seed=301)
 
-        ml_report = run_ensemble_detector(ml_ref, ml_prod)
-        rag_report = run_ensemble_detector(rag_ref, rag_prod)
+        ml_report = run_drift_detector(ml_ref, ml_prod)
+        rag_report = run_drift_detector(rag_ref, rag_prod)
 
         print_dual_layer_impact(
-            ml_severity=ml_report["overall_severity"],
-            rag_severity=rag_report["overall_severity"],
+            ml_severity=ml_report["severity"],
+            rag_severity=rag_report["severity"],
             shift=max(ml_shift, rag_shift),
         )
         print(f"  {'-' * 56}")
@@ -565,53 +468,51 @@ def main() -> None:
     print("Demo complete.")
     print(
         "In production, both ML feature drift and RAG embedding drift are\n"
-        "monitored continuously. Compound drift (both layers shifting) is the\n"
-        "highest-risk scenario because more transactions enter the gray zone\n"
-        "while the LLM analysis that handles them is also unreliable.\n"
+        "monitored continuously using MMD.  Compound drift (both layers\n"
+        "shifting) is the highest-risk scenario because more transactions\n"
+        "enter the gray zone while the async LLM investigation that handles\n"
+        "them is also unreliable.\n"
         "Reports are streamed to LangSmith and alert channels (Slack, PagerDuty)."
     )
     print()
 
     # ---------------------------------------------------------------------------
-    # Visualization: drift metrics over time for both layers
+    # Visualization: MMD over time for both layers
     # ---------------------------------------------------------------------------
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        metric_names = list(THRESHOLDS.keys())
-        fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=False)
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
 
-        # --- Part 1 chart: RAG embedding drift metrics over shift schedule ---
+        # --- Part 1 chart: RAG embedding MMD over shift schedule ---
         ax = axes[0]
-        for metric in metric_names:
-            values = [r["scores"][metric] for r in rag_reports]
-            shifts = [r["_shift"] for r in rag_reports]
-            ax.plot(shifts, values, marker="o", label=metric.replace("_", " ").title(), linewidth=1.5)
+        mmd_values = [r["mmd"] for r in rag_reports]
+        shifts = [r["_shift"] for r in rag_reports]
+        ax.plot(shifts, mmd_values, marker="o", color="#1B4F72", linewidth=1.5, label="MMD")
         # Add threshold bands
-        ax.axhspan(0, 0.05, alpha=0.08, color="green", label="Nominal zone")
-        ax.axhspan(0.05, 0.15, alpha=0.08, color="orange")
-        ax.axhspan(0.15, ax.get_ylim()[1] if ax.get_ylim()[1] > 0.3 else 0.5, alpha=0.08, color="red")
+        ax.axhline(MMD_THRESHOLDS["nominal_upper"], color="green", linestyle="--", alpha=0.7, label="Nominal upper")
+        ax.axhline(MMD_THRESHOLDS["warning_upper"], color="orange", linestyle="--", alpha=0.7, label="Warning upper")
+        ax.axhline(MMD_THRESHOLDS["critical_upper"], color="red", linestyle="--", alpha=0.7, label="Critical upper")
         ax.set_xlabel("Mean Shift Magnitude")
-        ax.set_ylabel("Metric Value")
-        ax.set_title("RAG Embedding Drift Metrics Over Increasing Shift")
-        ax.legend(fontsize=8, ncol=2)
+        ax.set_ylabel("MMD Value")
+        ax.set_title("RAG Embedding Drift (MMD) Over Increasing Shift")
+        ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
-        # --- Part 2 chart: ML feature drift metrics over shift schedule ---
+        # --- Part 2 chart: ML feature MMD over shift schedule ---
         ax = axes[1]
-        for metric in metric_names:
-            values = [r["scores"][metric] for r in ml_reports]
-            shifts = [r["_shift"] for r in ml_reports]
-            ax.plot(shifts, values, marker="s", label=metric.replace("_", " ").title(), linewidth=1.5)
-        ax.axhspan(0, 0.05, alpha=0.08, color="green", label="Nominal zone")
-        ax.axhspan(0.05, 0.15, alpha=0.08, color="orange")
-        ax.axhspan(0.15, ax.get_ylim()[1] if ax.get_ylim()[1] > 0.3 else 0.5, alpha=0.08, color="red")
+        mmd_values = [r["mmd"] for r in ml_reports]
+        shifts = [r["_shift"] for r in ml_reports]
+        ax.plot(shifts, mmd_values, marker="s", color="#2E86C1", linewidth=1.5, label="MMD")
+        ax.axhline(MMD_THRESHOLDS["nominal_upper"], color="green", linestyle="--", alpha=0.7, label="Nominal upper")
+        ax.axhline(MMD_THRESHOLDS["warning_upper"], color="orange", linestyle="--", alpha=0.7, label="Warning upper")
+        ax.axhline(MMD_THRESHOLDS["critical_upper"], color="red", linestyle="--", alpha=0.7, label="Critical upper")
         ax.set_xlabel("Mean Shift Magnitude")
-        ax.set_ylabel("Metric Value")
-        ax.set_title("ML Feature Drift Metrics Over Increasing Shift")
-        ax.legend(fontsize=8, ncol=2)
+        ax.set_ylabel("MMD Value")
+        ax.set_title("ML Feature Drift (MMD) Over Increasing Shift")
+        ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
 
         plt.tight_layout()

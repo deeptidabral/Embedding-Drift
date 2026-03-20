@@ -5,20 +5,26 @@ Every public function accepts two numpy arrays -- a reference distribution
 and a production distribution -- and returns a ``DriftResult`` that
 carries the metric value, an optional p-value, and a boolean indicating
 statistical significance at the configured alpha level.
+
+Design rationale
+----------------
+Dense embedding dimensions are highly entangled.  Univariate tests (e.g.
+KS per dimension) suffer from massive multiple-testing problems and miss
+multivariate rotations.  Cosine distance only captures mean shift.  PCA
+explained-variance comparisons miss mean shift entirely.  Only MMD --
+a kernel-based two-sample test that operates on the full joint
+distribution -- correctly assesses high-dimensional distributional
+divergence.  Therefore MMD is the sole drift metric used here.
 """
 
 from __future__ import annotations
 
 import logging
-from enum import Enum
 from typing import Literal
 
 import numpy as np
 from pydantic import BaseModel, Field
 from scipy.spatial.distance import cdist
-from scipy.stats import ks_2samp, norm
-from scipy.linalg import sqrtm
-from sklearn.decomposition import PCA
 
 logger = logging.getLogger(__name__)
 
@@ -42,55 +48,7 @@ class DriftResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 1. Cosine distance drift
-# ---------------------------------------------------------------------------
-
-
-def cosine_distance_drift(
-    reference: np.ndarray,
-    production: np.ndarray,
-    alpha: float = DEFAULT_ALPHA,
-) -> DriftResult:
-    """Mean pairwise cosine distance between reference and production centroids.
-
-    A permutation-based p-value is estimated by shuffling the combined
-    pool and re-computing the statistic 200 times.
-    """
-    _validate_shapes(reference, production)
-
-    ref_centroid = reference.mean(axis=0, keepdims=True)
-    prod_centroid = production.mean(axis=0, keepdims=True)
-
-    observed = float(cdist(ref_centroid, prod_centroid, metric="cosine")[0, 0])
-
-    # Permutation test
-    combined = np.concatenate([reference, production], axis=0)
-    n_ref = reference.shape[0]
-    n_permutations = 200
-    count_ge = 0
-
-    rng = np.random.default_rng(seed=42)
-    for _ in range(n_permutations):
-        perm = rng.permutation(combined.shape[0])
-        perm_ref = combined[perm[:n_ref]].mean(axis=0, keepdims=True)
-        perm_prod = combined[perm[n_ref:]].mean(axis=0, keepdims=True)
-        perm_dist = float(cdist(perm_ref, perm_prod, metric="cosine")[0, 0])
-        if perm_dist >= observed:
-            count_ge += 1
-
-    p_value = (count_ge + 1) / (n_permutations + 1)
-
-    return DriftResult(
-        metric_name="cosine_distance",
-        value=observed,
-        p_value=p_value,
-        is_significant=p_value < alpha,
-        alpha=alpha,
-    )
-
-
-# ---------------------------------------------------------------------------
-# 2. Maximum Mean Discrepancy (MMD)
+# Maximum Mean Discrepancy (MMD)
 # ---------------------------------------------------------------------------
 
 
@@ -168,186 +126,6 @@ def maximum_mean_discrepancy(
         is_significant=p_value < alpha,
         alpha=alpha,
         details={"kernel": 0.0 if kernel == "rbf" else 1.0},
-    )
-
-
-# ---------------------------------------------------------------------------
-# 3. Kolmogorov-Smirnov test per PCA component
-# ---------------------------------------------------------------------------
-
-
-def kolmogorov_smirnov_per_component(
-    reference: np.ndarray,
-    production: np.ndarray,
-    n_components: int = 10,
-    alpha: float = DEFAULT_ALPHA,
-) -> DriftResult:
-    """KS test on the leading PCA components of the embedding space.
-
-    PCA is fit on the *reference* distribution; both sets are projected.
-    The returned value is the maximum KS statistic across components,
-    and drift is declared significant if any component rejects the
-    null hypothesis after Bonferroni correction.
-    """
-    _validate_shapes(reference, production)
-
-    n_components = min(n_components, reference.shape[1], reference.shape[0])
-    pca = PCA(n_components=n_components, random_state=42)
-    ref_proj = pca.fit_transform(reference)
-    prod_proj = pca.transform(production)
-
-    ks_stats: list[float] = []
-    p_values: list[float] = []
-    corrected_alpha = alpha / n_components  # Bonferroni correction
-
-    for comp in range(n_components):
-        stat, pval = ks_2samp(ref_proj[:, comp], prod_proj[:, comp])
-        ks_stats.append(float(stat))
-        p_values.append(float(pval))
-
-    max_stat = max(ks_stats)
-    min_p = min(p_values)
-    is_significant = min_p < corrected_alpha
-
-    component_details = {
-        f"ks_stat_pc{i}": s for i, s in enumerate(ks_stats)
-    }
-    component_details.update(
-        {f"p_value_pc{i}": p for i, p in enumerate(p_values)}
-    )
-
-    return DriftResult(
-        metric_name="ks_per_component",
-        value=max_stat,
-        p_value=min_p,
-        is_significant=is_significant,
-        alpha=alpha,
-        details=component_details,
-    )
-
-
-# ---------------------------------------------------------------------------
-# 4. Wasserstein (Earth-Mover) distance drift
-# ---------------------------------------------------------------------------
-
-
-def wasserstein_distance_drift(
-    reference: np.ndarray,
-    production: np.ndarray,
-    alpha: float = DEFAULT_ALPHA,
-) -> DriftResult:
-    """Sliced Wasserstein distance between two high-dimensional distributions.
-
-    Projects both distributions onto 50 random unit vectors, computes the
-    1-D Wasserstein distance for each projection, and averages.  A
-    permutation p-value is provided via 200 shuffles.
-    """
-    _validate_shapes(reference, production)
-
-    n_projections = 50
-    rng = np.random.default_rng(seed=42)
-    directions = rng.standard_normal((n_projections, reference.shape[1]))
-    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
-
-    def _sliced_wd(x: np.ndarray, y: np.ndarray) -> float:
-        total = 0.0
-        for d in directions:
-            px = np.sort(x @ d)
-            py = np.sort(y @ d)
-            # Interpolate to equal length for 1-D comparison
-            min_len = min(len(px), len(py))
-            px_interp = np.interp(
-                np.linspace(0, 1, min_len), np.linspace(0, 1, len(px)), px
-            )
-            py_interp = np.interp(
-                np.linspace(0, 1, min_len), np.linspace(0, 1, len(py)), py
-            )
-            total += float(np.mean(np.abs(px_interp - py_interp)))
-        return total / n_projections
-
-    observed = _sliced_wd(reference, production)
-
-    # Permutation test
-    combined = np.concatenate([reference, production], axis=0)
-    n_ref = reference.shape[0]
-    n_permutations = 200
-    count_ge = 0
-
-    for _ in range(n_permutations):
-        perm = rng.permutation(combined.shape[0])
-        perm_val = _sliced_wd(combined[perm[:n_ref]], combined[perm[n_ref:]])
-        if perm_val >= observed:
-            count_ge += 1
-
-    p_value = (count_ge + 1) / (n_permutations + 1)
-
-    return DriftResult(
-        metric_name="wasserstein",
-        value=observed,
-        p_value=p_value,
-        is_significant=p_value < alpha,
-        alpha=alpha,
-    )
-
-
-# ---------------------------------------------------------------------------
-# 5. Population Stability Index (PSI)
-# ---------------------------------------------------------------------------
-
-
-def population_stability_index(
-    reference: np.ndarray,
-    production: np.ndarray,
-    n_bins: int = 20,
-    alpha: float = DEFAULT_ALPHA,
-) -> DriftResult:
-    """PSI computed on the first principal component.
-
-    PSI thresholds (conventional):
-      * < 0.10  -- no significant shift
-      * 0.10-0.25 -- moderate shift
-      * > 0.25  -- significant shift
-
-    The ``is_significant`` flag is set when PSI exceeds 0.25.
-    """
-    _validate_shapes(reference, production)
-
-    pca = PCA(n_components=1, random_state=42)
-    ref_1d = pca.fit_transform(reference).ravel()
-    prod_1d = pca.transform(production).ravel()
-
-    # Build bins from reference
-    breakpoints = np.linspace(
-        min(ref_1d.min(), prod_1d.min()) - 1e-6,
-        max(ref_1d.max(), prod_1d.max()) + 1e-6,
-        n_bins + 1,
-    )
-
-    ref_counts, _ = np.histogram(ref_1d, bins=breakpoints)
-    prod_counts, _ = np.histogram(prod_1d, bins=breakpoints)
-
-    # Convert to proportions with smoothing
-    eps = 1e-8
-    ref_prop = (ref_counts + eps) / (ref_counts.sum() + eps * n_bins)
-    prod_prop = (prod_counts + eps) / (prod_counts.sum() + eps * n_bins)
-
-    psi = float(np.sum((prod_prop - ref_prop) * np.log(prod_prop / ref_prop)))
-
-    # Conventional thresholds mapped to a synthetic p-value for uniformity.
-    if psi < 0.10:
-        synthetic_p = 0.50
-    elif psi < 0.25:
-        synthetic_p = 0.05
-    else:
-        synthetic_p = 0.001
-
-    return DriftResult(
-        metric_name="psi",
-        value=psi,
-        p_value=synthetic_p,
-        is_significant=psi > 0.25,
-        alpha=alpha,
-        details={"n_bins": float(n_bins)},
     )
 
 

@@ -1,14 +1,27 @@
 """
 Full End-to-End Pipeline: Real LLM + Real Embeddings + LangSmith Tracing
 
-This script runs the complete dual-layer fraud detection pipeline using:
+This script runs the complete fraud detection pipeline using:
 - Sparkov dataset (real transaction data)
 - sentence-transformers all-MiniLM-L6-v2 (real embeddings, local)
 - Ollama phi3:mini (real LLM, local, no API key)
 - In-memory vector search (cosine similarity on numpy arrays)
 - LangSmith tracing (real dashboard, requires LANGCHAIN_API_KEY)
 - Evidently AI (real drift reports, local)
-- Custom drift metrics (cosine, MMD, KS, Wasserstein, PSI)
+- MMD drift detection (the sole drift metric -- see design note below)
+
+Architecture:
+- ML model (XGBoost) runs in the real-time authorization path.
+- LLM/RAG investigation runs ASYNCHRONOUSLY for flagged transactions
+  (gray-zone ML scores or high-value amounts).  The LLM does NOT block
+  the authorization decision.
+
+Design note on drift detection:
+  Dense embedding dimensions are highly entangled.  Univariate tests
+  (KS per dimension) suffer from massive multiple-testing problems and
+  miss multivariate rotations.  Cosine distance only captures mean
+  shift.  PCA explained-variance comparisons miss mean shift entirely.
+  Only MMD correctly assesses the full high-dimensional distribution.
 
 No mocks, no simulations, no synthetic data. Every component is real.
 
@@ -199,16 +212,20 @@ def retrieve_similar(
 
 
 # ---------------------------------------------------------------------------
-# Step 4: LLM fraud assessment via Ollama
+# Step 4: LLM fraud assessment via Ollama (ASYNC investigation layer)
 # ---------------------------------------------------------------------------
 
-@traceable(name="llm-fraud-assessment", run_type="llm")
+@traceable(name="llm-fraud-investigation-async", run_type="llm")
 def assess_fraud_with_llm(
     transaction_text: str,
     similar_patterns: list[dict],
     ml_score: float,
 ) -> dict:
-    """Call Ollama phi3:mini to assess fraud risk with retrieved context."""
+    """Call Ollama phi3:mini to investigate a flagged transaction.
+
+    This runs ASYNCHRONOUSLY after the real-time authorization decision.
+    It does NOT block the transaction authorization path.
+    """
     import ollama
 
     context_lines = []
@@ -223,7 +240,7 @@ def assess_fraud_with_llm(
     prompt = f"""You are a fraud detection analyst at a major payment processor.
 
 The ML model scored this transaction with a fraud probability of {ml_score:.2f}.
-This score falls in the gray zone (0.3-0.7), requiring deeper analysis.
+This transaction has been flagged for deeper investigation (post-authorization).
 
 CURRENT TRANSACTION:
 {transaction_text}
@@ -234,7 +251,7 @@ SIMILAR HISTORICAL PATTERNS FROM THE KNOWLEDGE BASE:
 Based on the transaction details and similar historical patterns, provide:
 1. Your fraud risk assessment (LOW, MEDIUM, HIGH, or CRITICAL).
 2. A brief explanation (2-3 sentences) of why.
-3. Recommended action (APPROVE, FLAG_FOR_REVIEW, DECLINE, or BLOCK_CARD).
+3. Recommended follow-up action (CLEAR, MONITOR, ESCALATE, or BLOCK_CARD).
 
 Respond in this exact format:
 RISK: [your assessment]
@@ -281,10 +298,10 @@ def ml_score_transaction(row: dict) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Step 6: Full dual-layer pipeline with LangSmith tracing
+# Step 6: Full pipeline with LangSmith tracing
 # ---------------------------------------------------------------------------
 
-@traceable(name="dual-layer-fraud-pipeline", run_type="chain")
+@traceable(name="fraud-detection-pipeline", run_type="chain")
 def process_transaction(
     row: dict,
     transaction_text: str,
@@ -293,21 +310,48 @@ def process_transaction(
     kb_texts: list[str],
     kb_metadata: list[dict],
 ) -> dict:
-    """Process a single transaction through the full dual-layer pipeline."""
+    """Process a single transaction through the pipeline.
 
-    # Layer 1: ML Model
+    The ML model runs synchronously for the authorization decision.
+    Flagged transactions are investigated asynchronously by the LLM.
+    """
+
+    # Real-time layer: ML Model (authorization path)
     ml_score = ml_score_transaction(row)
 
-    # Decision routing
+    # Decision routing -- ML score only
     amt = float(row.get("amt", 0))
     gray_zone = 0.3 <= ml_score <= 0.7
     high_value = amt > 10000
 
-    if gray_zone or high_value:
-        # Layer 2: RAG + LLM
-        analysis_tier = "ml_plus_llm"
+    if ml_score >= 0.7:
+        # Clear decline
+        return {
+            "transaction_id": row.get("trans_num", "unknown"),
+            "ml_score": round(ml_score, 4),
+            "authorization_decision": "DECLINE",
+            "analysis_tier": "ml_only",
+            "routing_reason": "clear_decline",
+            "llm_investigation": None,
+            "is_fraud_actual": int(row.get("is_fraud", 0)),
+        }
+    elif ml_score < 0.3 and not high_value:
+        # Clear approval
+        return {
+            "transaction_id": row.get("trans_num", "unknown"),
+            "ml_score": round(ml_score, 4),
+            "authorization_decision": "APPROVE",
+            "analysis_tier": "ml_only",
+            "routing_reason": "clear_approval",
+            "llm_investigation": None,
+            "is_fraud_actual": int(row.get("is_fraud", 0)),
+        }
+    else:
+        # Flagged -- authorize provisionally, then investigate async
+        auth_decision = "FLAG_FOR_REVIEW"
         reason = "gray_zone" if gray_zone else "high_value"
 
+        # Async LLM investigation (post-authorization)
         similar = retrieve_similar(
             transaction_embedding, kb_embeddings, kb_texts, kb_metadata, top_k=3
         )
@@ -317,90 +361,67 @@ def process_transaction(
         # Parse LLM response
         response_text = llm_result["response"]
         llm_risk = "MEDIUM"
-        llm_action = "FLAG_FOR_REVIEW"
+        llm_action = "MONITOR"
         for line in response_text.split("\n"):
             if line.strip().startswith("RISK:"):
                 llm_risk = line.split(":", 1)[1].strip().upper()
             if line.strip().startswith("ACTION:"):
                 llm_action = line.split(":", 1)[1].strip().upper()
 
-        # Blend scores
-        risk_map = {"LOW": 0.2, "MEDIUM": 0.5, "HIGH": 0.75, "CRITICAL": 0.95}
-        llm_score = risk_map.get(llm_risk, 0.5)
-        final_score = 0.6 * ml_score + 0.4 * llm_score
-
         return {
             "transaction_id": row.get("trans_num", "unknown"),
             "ml_score": round(ml_score, 4),
-            "llm_score": round(llm_score, 4),
-            "final_score": round(final_score, 4),
-            "analysis_tier": analysis_tier,
+            "authorization_decision": auth_decision,
+            "analysis_tier": "ml_flagged_async_llm_investigation",
             "routing_reason": reason,
-            "llm_risk": llm_risk,
-            "llm_action": llm_action,
-            "llm_response": response_text[:300],
-            "n_similar_patterns": len(similar),
-            "top_similarity": round(similar[0]["similarity"], 4) if similar else 0,
-            "is_fraud_actual": int(row.get("is_fraud", 0)),
-        }
-    else:
-        # ML only
-        action = "APPROVE" if ml_score < 0.3 else "DECLINE"
-        return {
-            "transaction_id": row.get("trans_num", "unknown"),
-            "ml_score": round(ml_score, 4),
-            "llm_score": None,
-            "final_score": round(ml_score, 4),
-            "analysis_tier": "ml_only",
-            "routing_reason": "clear_decision",
-            "llm_risk": None,
-            "llm_action": action,
-            "llm_response": None,
-            "n_similar_patterns": 0,
-            "top_similarity": 0,
+            "llm_investigation": {
+                "llm_risk": llm_risk,
+                "llm_action": llm_action,
+                "llm_response": response_text[:300],
+                "n_similar_patterns": len(similar),
+                "top_similarity": round(similar[0]["similarity"], 4) if similar else 0,
+            },
             "is_fraud_actual": int(row.get("is_fraud", 0)),
         }
 
 
 # ---------------------------------------------------------------------------
-# Step 7: Drift detection
+# Step 7: Drift detection (MMD only)
 # ---------------------------------------------------------------------------
 
 def run_drift_detection(
     ref_embeddings: np.ndarray,
     prod_embeddings: np.ndarray,
 ) -> dict:
-    """Run all drift metrics and ensemble detector."""
+    """Run MMD drift detection."""
     print("=" * 72)
-    print("STEP 7: DRIFT DETECTION (5 METRICS + ENSEMBLE)")
+    print("STEP 7: DRIFT DETECTION (MMD)")
     print("=" * 72)
+    print()
+    print("  Design note: Dense embedding dimensions are highly entangled.")
+    print("  Univariate tests (KS per dim) suffer from multiple-testing")
+    print("  problems. Cosine distance only captures mean shift. Only MMD")
+    print("  correctly assesses the full high-dimensional distribution.")
+    print()
 
-    from src.drift_detection.metrics import (
-        cosine_distance_drift,
-        maximum_mean_discrepancy,
-        kolmogorov_smirnov_per_component,
-        wasserstein_distance_drift,
-        population_stability_index,
-    )
+    from src.drift_detection.metrics import maximum_mean_discrepancy
     from src.drift_detection.detectors import EmbeddingDriftDetector
 
-    results = {}
-    for name, func in [
-        ("cosine", cosine_distance_drift),
-        ("mmd", maximum_mean_discrepancy),
-        ("ks", kolmogorov_smirnov_per_component),
-        ("wasserstein", wasserstein_distance_drift),
-        ("psi", population_stability_index),
-    ]:
-        r = func(ref_embeddings, prod_embeddings)
-        results[name] = {"value": r.value, "p_value": r.p_value, "significant": r.is_significant}
-        print(f"  {name:12s}: value={r.value:.6f}, p_value={r.p_value:.4f}, significant={r.is_significant}")
+    # Run MMD
+    mmd_result = maximum_mean_discrepancy(ref_embeddings, prod_embeddings)
+    print(f"  MMD: value={mmd_result.value:.6f}, p_value={mmd_result.p_value:.4f}, significant={mmd_result.is_significant}")
 
-    detector = EmbeddingDriftDetector(min_metrics_agreeing=2)
+    # Run detector for severity classification
+    detector = EmbeddingDriftDetector()
     report = detector.evaluate(ref_embeddings, prod_embeddings)
-    results["ensemble_severity"] = report.overall_severity.value
-    results["recommended_actions"] = report.recommended_actions
-    print(f"  Ensemble severity: {report.overall_severity.value}")
+    print(f"  Severity: {report.overall_severity.value}")
+    print(f"  Actions:  {'; '.join(report.recommended_actions)}")
+
+    results = {
+        "mmd": {"value": mmd_result.value, "p_value": mmd_result.p_value, "significant": mmd_result.is_significant},
+        "severity": report.overall_severity.value,
+        "recommended_actions": report.recommended_actions,
+    }
 
     # Post drift metrics to LangSmith as custom feedback scores
     api_key = os.environ.get("LANGCHAIN_API_KEY", "")
@@ -421,24 +442,23 @@ def run_drift_detection(
                 target_run = runs[0]
                 severity_map = {"none": 0.0, "low": 0.25, "moderate": 0.5, "high": 0.75, "critical": 1.0}
 
-                # Post each drift metric as a feedback score
-                for metric_name in ["cosine", "mmd", "ks", "wasserstein", "psi"]:
-                    ls_client.create_feedback(
-                        run_id=target_run.id,
-                        key=f"drift_{metric_name}",
-                        score=float(results[metric_name]["value"]),
-                        comment=f"p_value={results[metric_name]['p_value']:.4f}, significant={results[metric_name]['significant']}",
-                    )
+                # Post MMD as a feedback score
+                ls_client.create_feedback(
+                    run_id=target_run.id,
+                    key="drift_mmd",
+                    score=float(mmd_result.value),
+                    comment=f"p_value={mmd_result.p_value:.4f}, significant={mmd_result.is_significant}",
+                )
 
-                # Post ensemble severity as a feedback score
+                # Post severity as a feedback score
                 ls_client.create_feedback(
                     run_id=target_run.id,
                     key="drift_severity",
                     score=severity_map.get(report.overall_severity.value, 0.0),
-                    comment=f"Ensemble severity: {report.overall_severity.value}. Actions: {'; '.join(report.recommended_actions)}",
+                    comment=f"Severity: {report.overall_severity.value}. Actions: {'; '.join(report.recommended_actions)}",
                 )
 
-                print(f"  Posted 6 drift feedback scores to LangSmith run {target_run.id}")
+                print(f"  Posted 2 drift feedback scores to LangSmith run {target_run.id}")
         except Exception as e:
             print(f"  Failed to post drift scores to LangSmith: {e}")
 
@@ -521,40 +541,44 @@ def generate_visualizations(results: list[dict], drift_results: dict) -> None:
     axes[1].set_title("ML Score Distribution")
     axes[1].legend()
 
-    # Chart 3: Drift metrics
-    metrics = ["cosine", "mmd", "ks", "wasserstein", "psi"]
-    values = [drift_results[m]["value"] for m in metrics]
-    colors = ["#D32F2F" if drift_results[m]["significant"] else "#4CAF50" for m in metrics]
-    axes[2].barh(metrics, values, color=colors)
+    # Chart 3: MMD drift metric
+    mmd_val = drift_results["mmd"]["value"]
+    mmd_sig = drift_results["mmd"]["significant"]
+    bar_color = "#D32F2F" if mmd_sig else "#4CAF50"
+    axes[2].barh(["MMD"], [mmd_val], color=bar_color)
     axes[2].set_xlabel("Drift Value")
-    axes[2].set_title("Drift Metrics (red = significant)")
+    sig_label = "significant" if mmd_sig else "not significant"
+    axes[2].set_title(f"MMD Drift ({sig_label})")
 
     plt.tight_layout()
     plt.savefig("reports/visualizations/15_live_pipeline_summary.png", dpi=150, bbox_inches="tight")
     plt.close()
     print("  Saved: reports/visualizations/15_live_pipeline_summary.png")
 
-    # Chart 4: LLM assessment details (for escalated transactions)
-    escalated = df_results[df_results["analysis_tier"] == "ml_plus_llm"]
-    if len(escalated) > 0:
+    # Chart 4: LLM investigation details (for flagged transactions)
+    flagged = df_results[df_results["analysis_tier"] == "ml_flagged_async_llm_investigation"]
+    if len(flagged) > 0 and "llm_investigation" in flagged.columns:
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-        if "llm_risk" in escalated.columns:
-            risk_counts = escalated["llm_risk"].value_counts()
-            axes[0].bar(risk_counts.index, risk_counts.values, color="#2196F3")
-            axes[0].set_title(f"LLM Risk Assessments (n={len(escalated)})")
+        llm_risks = [r["llm_risk"] for r in flagged["llm_investigation"] if r is not None]
+        llm_actions = [r["llm_action"] for r in flagged["llm_investigation"] if r is not None]
+
+        if llm_risks:
+            risk_series = pd.Series(llm_risks).value_counts()
+            axes[0].bar(risk_series.index, risk_series.values, color="#2196F3")
+            axes[0].set_title(f"LLM Risk Assessments (n={len(llm_risks)}, async)")
             axes[0].set_ylabel("Count")
 
-        if "llm_action" in escalated.columns:
-            action_counts = escalated["llm_action"].value_counts()
-            axes[1].bar(action_counts.index, action_counts.values, color="#FF5722")
-            axes[1].set_title("LLM Recommended Actions")
+        if llm_actions:
+            action_series = pd.Series(llm_actions).value_counts()
+            axes[1].bar(action_series.index, action_series.values, color="#FF5722")
+            axes[1].set_title("LLM Recommended Actions (async)")
             axes[1].set_ylabel("Count")
 
         plt.tight_layout()
-        plt.savefig("reports/visualizations/16_llm_assessments.png", dpi=150, bbox_inches="tight")
+        plt.savefig("reports/visualizations/16_llm_investigations.png", dpi=150, bbox_inches="tight")
         plt.close()
-        print("  Saved: reports/visualizations/16_llm_assessments.png")
+        print("  Saved: reports/visualizations/16_llm_investigations.png")
 
     print()
 
@@ -564,12 +588,17 @@ def generate_visualizations(results: list[dict], drift_results: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """Run the complete dual-layer fraud detection pipeline."""
+    """Run the complete fraud detection pipeline."""
     start_time = time.time()
 
     print()
     print("EMBEDDING DRIFT MONITORING: FULL LIVE PIPELINE EXECUTION")
     print("Using: Sparkov dataset + sentence-transformers + Ollama phi3:mini + LangSmith")
+    print()
+    print("Architecture:")
+    print("  - ML model: synchronous, real-time authorization path")
+    print("  - LLM/RAG:  asynchronous, post-transaction investigation for flagged txns")
+    print("  - Drift:    MMD-based (sole metric for high-dimensional embedding spaces)")
     print()
 
     # Step 0
@@ -585,9 +614,9 @@ def main() -> None:
     ref_embeddings = kb_emb
     prod_embeddings = prod_emb
 
-    # Step 3-6: Process transactions through the dual-layer pipeline
+    # Step 3-6: Process transactions through the pipeline
     print("=" * 72)
-    print("STEPS 3-6: PROCESSING TRANSACTIONS (ML + RAG + LLM + LANGSMITH)")
+    print("STEPS 3-6: PROCESSING TRANSACTIONS (ML auth + async LLM investigation)")
     print("=" * 72)
 
     n_transactions = 20  # Process 20 transactions to demonstrate the pipeline
@@ -618,10 +647,12 @@ def main() -> None:
         results.append(result)
 
         tier = result["analysis_tier"]
-        score = result["final_score"]
+        auth = result["authorization_decision"]
         fraud = "FRAUD" if result["is_fraud_actual"] else "LEGIT"
-        llm_info = f", LLM: {result['llm_risk']}" if result["llm_risk"] else ""
-        print(f"  [{i+1:2d}/{n_transactions}] {tier:14s} | ML={result['ml_score']:.3f}{llm_info} | final={score:.3f} | actual={fraud}")
+        llm_info = ""
+        if result.get("llm_investigation"):
+            llm_info = f", async LLM: {result['llm_investigation']['llm_risk']}"
+        print(f"  [{i+1:2d}/{n_transactions}] {tier:40s} | auth={auth:16s} | ML={result['ml_score']:.3f}{llm_info} | actual={fraud}")
 
     # Post per-transaction feedback to LangSmith
     api_key = os.environ.get("LANGCHAIN_API_KEY", "")
@@ -639,7 +670,7 @@ def main() -> None:
             ))
 
             # Match runs to results by order (most recent first)
-            pipeline_runs = [r for r in recent_runs if r.name == "dual-layer-fraud-pipeline"]
+            pipeline_runs = [r for r in recent_runs if r.name == "fraud-detection-pipeline"]
             n_matched = min(len(pipeline_runs), len(results))
 
             for idx in range(n_matched):
@@ -651,25 +682,13 @@ def main() -> None:
                     run_id=run.id,
                     key="ml_score",
                     score=res["ml_score"],
-                    comment=f"Analysis tier: {res['analysis_tier']}",
-                )
-                ls_client.create_feedback(
-                    run_id=run.id,
-                    key="final_score",
-                    score=res["final_score"],
+                    comment=f"Analysis tier: {res['analysis_tier']}, auth: {res['authorization_decision']}",
                 )
                 ls_client.create_feedback(
                     run_id=run.id,
                     key="is_fraud_actual",
                     score=float(res["is_fraud_actual"]),
                 )
-                if res["llm_score"] is not None:
-                    ls_client.create_feedback(
-                        run_id=run.id,
-                        key="llm_score",
-                        score=res["llm_score"],
-                        comment=f"LLM risk: {res['llm_risk']}, action: {res['llm_action']}",
-                    )
 
             print(f"  Posted feedback scores to {n_matched} LangSmith runs.")
         except Exception as e:
@@ -677,9 +696,13 @@ def main() -> None:
 
     # Summary
     ml_only = sum(1 for r in results if r["analysis_tier"] == "ml_only")
-    ml_llm = sum(1 for r in results if r["analysis_tier"] == "ml_plus_llm")
+    flagged = sum(1 for r in results if r["analysis_tier"] == "ml_flagged_async_llm_investigation")
+    approved = sum(1 for r in results if r["authorization_decision"] == "APPROVE")
+    declined = sum(1 for r in results if r["authorization_decision"] == "DECLINE")
+    flagged_review = sum(1 for r in results if r["authorization_decision"] == "FLAG_FOR_REVIEW")
     print()
-    print(f"  Summary: {ml_only} ML-only, {ml_llm} ML+LLM ({ml_llm/len(results):.0%} escalated)")
+    print(f"  Summary: {ml_only} ML-only, {flagged} flagged for async LLM investigation")
+    print(f"  Auth decisions: {approved} approved, {declined} declined, {flagged_review} flagged for review")
     print()
 
     # Step 7
@@ -700,12 +723,18 @@ def main() -> None:
     print("=" * 72)
     print(f"  Total time: {elapsed:.1f}s")
     print(f"  Transactions processed: {len(results)}")
-    print(f"  ML-only: {ml_only}, ML+LLM: {ml_llm}")
-    print(f"  Drift severity: {drift_results['ensemble_severity']}")
+    print(f"  ML-only: {ml_only}, Flagged (async LLM): {flagged}")
+    print(f"  Auth: {approved} approved, {declined} declined, {flagged_review} flagged")
+    print(f"  Drift (MMD) severity: {drift_results['severity']}")
+    print()
+    print("  Architecture:")
+    print("    ML model  -> synchronous authorization (approve / decline / flag)")
+    print("    LLM/RAG   -> async post-transaction investigation (flagged txns only)")
+    print("    Drift      -> MMD-based monitoring (sole metric)")
     print()
     print("  Outputs:")
     print("    reports/visualizations/15_live_pipeline_summary.png")
-    print("    reports/visualizations/16_llm_assessments.png")
+    print("    reports/visualizations/16_llm_investigations.png")
     print("    reports/evidently/live_embedding_drift.html")
     print("    reports/evidently/live_feature_drift.html")
     print()

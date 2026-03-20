@@ -5,6 +5,7 @@
 - Embedding drift is silent degradation of the embedding space powering the RAG complement layer in dual-layer fraud detection systems.
 - Unlike crashes or errors, drift produces subtly wrong results that accumulate until the complement layer operates well below intended performance.
 - Distinct from ML model feature drift (which affects the primary scorer's structured inputs). Both must be tracked as they can compound.
+- **Note on embedding approach**: the text embedding method described in this project (e.g., all-MiniLM-L6-v2 over transaction text) is a simplified demonstration. Production fraud detection systems typically represent transactions via entity embeddings (learned representations of merchants, cardholders, devices), autoencoders over structured feature sets, or graph neural networks (GNNs) that capture relational structure across transaction networks. The drift theory and MMD-based detection framework apply regardless of the embedding method.
 
 ---
 
@@ -29,9 +30,8 @@
 
 ### Divergence Measures
 
-- MMD (Maximum Mean Discrepancy): kernel-based, sensitive to all distribution moments, no density estimation needed. Best suited for embedding drift.
-- Wasserstein Distance: theoretically appealing but computationally expensive in high dimensions. Use sliced variants.
-- KL Divergence: requires density estimation, unreliable in high dimensions. Sometimes applied after dimensionality reduction.
+- MMD (Maximum Mean Discrepancy): kernel-based, sensitive to all distribution moments, no density estimation needed. This is the recommended detection method for embedding drift. With an RBF kernel and median heuristic bandwidth, MMD captures mean shifts, variance changes, tail behavior, and multimodality in a single statistic with a well-defined permutation test for p-value calibration.
+- Other measures (Wasserstein, KL divergence, KS test, PSI, cosine distance) are either computationally intractable in high dimensions, reduce to univariate tests that miss multivariate structure, or depend on binning that breaks down in dense embedding spaces. See the drift metrics and thresholds document for a detailed analysis of why these alternatives are inappropriate.
 
 ---
 

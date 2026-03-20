@@ -3,13 +3,14 @@
 ## Overview
 
 - Dual-layer fraud detection pipeline for large-scale payment processors.
-- Layer 1: XGBoost model scores all transactions at high speed.
-- Layer 2: RAG+LLM pipeline selectively invoked for gray zone, high-value, explainability, and novel pattern cases.
+- Layer 1 (real-time authorization): XGBoost model scores all transactions and drives the authorization decision within the payment processor's sub-50ms latency SLA.
+- Layer 2 (async investigation): RAG+LLM pipeline processes flagged transactions asynchronously after the authorization decision, supporting human analysts in manual review queues, chargeback defense, explainability reports, and regulatory audit documentation. The LLM never blocks a transaction decision.
 - Unified monitoring plane tracks ML feature drift and RAG embedding drift across both layers.
 
 Design priorities:
 
-- Sub-10ms ML scoring on the primary path. Sub-2s end-to-end for RAG+LLM path.
+- Sub-10ms ML scoring on the authorization path. Sub-50ms end-to-end authorization including routing.
+- RAG+LLM investigation path has no latency SLA (async, post-authorization).
 - 99.99% uptime on the ML scoring critical path.
 - Drift-induced accuracy loss detected before it causes material financial impact.
 
@@ -18,8 +19,8 @@ Design priorities:
 ## High-Level Architecture Diagram
 
 ```
-                         TRANSACTION PROCESSING PIPELINE
-                         ===============================
+                  REAL-TIME AUTHORIZATION PATH (sub-50ms SLA)
+                  ============================================
 
 +-------------------+       +----------------------+       +-------------------+
 |                   |       |                      |       |                   |
@@ -39,8 +40,6 @@ Design priorities:
                                                            |  Routes based on: |
                                                            |  - ML score       |
                                                            |  - Txn amount     |
-                                                           |  - Explainability |
-                                                           |    requirements   |
                                                            +---+----------+----+
                                                                |          |
                               +--------------------------------+          |
@@ -48,38 +47,72 @@ Design priorities:
                               v                                           v
               +---------------+-----------+           +-------------------+---------+
               |                           |           |                             |
-              |  Direct Decision          |           |  RAG+LLM Complement Layer  |
+              |  Direct Decision          |           |  Flag for Manual Review     |
               |  (70-80% of transactions) |           |  (20-30% of transactions)  |
               |                           |           |                             |
-              |  score < 0.3 -> approve   |           |  Embedding Service          |
-              |  score > 0.7 -> decline   |           |  (all-MiniLM-L6-v2 default; |
-              |                           |           |   text-embed-3-large opt.)  |
-              |                           |           |         |                   |
-              +---------------+-----------+           |         v                   |
-                              |                       |  Vector Store (ChromaDB)    |
-                              |                       |  (top-k fraud patterns)     |
-                              |                       |         |                   |
-                              |                       |         v                   |
-                              |                       |  RAG Retriever + Reranker   |
-                              |                       |         |                   |
-                              |                       |         v                   |
-                              |                       |  LLM Assessor (GPT-4o)      |
-                              |                       |                             |
-                              |                       |  Output:                    |
-                              |                       |  - fraud_probability        |
-                              |                       |  - reasoning                |
-                              |                       |  - matching_patterns        |
-                              |                       |  - recommended_action       |
-                              |                       |  - audit_trail              |
-                              |                       +-------------------+---------+
+              |  score < 0.3 -> approve   |           |  Authorization decision     |
+              |  score > 0.7 -> decline   |           |  made on ML score with      |
+              |                           |           |  conservative thresholds    |
+              +---------------+-----------+           +-------------------+---------+
                               |                                           |
                               v                                           v
                        +------+-------------------------------------------+------+
                        |                                                         |
-                       |                    Final Decision                       |
-                       |          approve | flag_for_review | decline | block    |
+                       |              Authorization Decision                     |
+                       |          approve | decline | flag_for_review             |
                        |                                                         |
-                       +---------------------------------------------------------+
+                       +------+--------------------------------------------------+
+                              |
+                              | (flagged transactions only)
+                              |
+- - - - - - - - - - - - - - -|- - - - - ASYNC BOUNDARY - - - - - - - - - - - - -
+                              |
+                              v
+                  ASYNC INVESTIGATION PATH (no latency SLA)
+                  ==========================================
+
+              +-------------------+---------+
+              |                             |
+              |  Async Investigation Queue  |
+              |  (flagged transactions)     |
+              +-------------------+---------+
+                                  |
+                                  v
+              +-------------------+---------+
+              |                             |
+              |  RAG+LLM Investigation      |
+              |                             |
+              |  Embedding Service          |
+              |  (all-MiniLM-L6-v2 default; |
+              |   text-embed-3-large opt.)  |
+              |         |                   |
+              |         v                   |
+              |  Vector Store (ChromaDB)    |
+              |  (top-k fraud patterns)     |
+              |         |                   |
+              |         v                   |
+              |  RAG Retriever + Reranker   |
+              |         |                   |
+              |         v                   |
+              |  LLM Assessor (GPT-4o)      |
+              |                             |
+              |  Output:                    |
+              |  - investigation_summary    |
+              |  - reasoning                |
+              |  - matching_patterns        |
+              |  - analyst_recommendations  |
+              |  - audit_trail              |
+              +-------------------+---------+
+                                  |
+                                  v
+              +-------------------+---------+
+              |                             |
+              |  Analyst Review Queue       |
+              |  (human decision on         |
+              |   flagged transactions      |
+              |   with LLM-generated        |
+              |   investigation reports)    |
+              +-----------------------------+
 
 
                          MONITORING PLANE (Asynchronous)
@@ -148,7 +181,7 @@ Design priorities:
 |                            | max depth 6-8)            |           | fallback engine.            |
 +----------------------------+---------------------------+-----------+-----------------------------+
 | Decision Router            | Stateless routing logic   | <1ms      | Defaults to ML-only         |
-|                            |                           |           | decision path.              |
+|                            | (authorize + flag)        |           | decision path. No flagging. |
 +----------------------------+---------------------------+-----------+-----------------------------+
 | Embedding Service          | sentence-transformers     | ~50ms     | ML-score-only decision.     |
 |                            | all-MiniLM-L6-v2 (default,| (local)   | Falls back to ML-only.      |
@@ -162,8 +195,9 @@ Design priorities:
 | RAG Retriever + Reranker   | Top-5 + ms-marco-MiniLM  | ~50ms     | Skip reranking. Use raw     |
 |                            | cross-encoder reranker    |           | retrieval results.          |
 +----------------------------+---------------------------+-----------+-----------------------------+
-| LLM Assessor               | GPT-4o (temp 0.0)        | ~1500ms   | ML-score-only with          |
-|                            |                           |           | LLM-unavailable flag.       |
+| LLM Assessor               | GPT-4o (temp 0.0)        | ~1500ms   | Flagged txns remain in      |
+| (async investigation)      |                           | (async)   | manual review queue without |
+|                            |                           |           | LLM assistance.             |
 +----------------------------+---------------------------+-----------+-----------------------------+
 | Embedding Sample Buffer    | Ring buffer (20K entries,  | <0.1ms   | Drift monitor suspends.     |
 |                            | lock-free concurrent)     |           | Transactions unaffected.    |
@@ -210,13 +244,13 @@ Design priorities:
 
 ### Decision Router
 
-- Determines processing path after ML scoring.
-- Score < 0.3: approve on ML score alone.
-- Score > 0.7: decline on ML score alone.
-- Score 0.3-0.7 (gray zone): route to RAG+LLM.
-- Amount > $10K: route to RAG+LLM regardless of score.
-- Explainability required: route to RAG+LLM for reasoning and pattern documentation.
-- During critical drift, routing thresholds can be adjusted to increase manual review.
+- Makes the real-time authorization decision and determines whether post-transaction investigation is needed.
+- Score < 0.3: approve on ML score alone. No further investigation.
+- Score > 0.7: decline on ML score alone. No further investigation.
+- Score 0.3-0.7 (gray zone): authorize with conservative thresholds, then flag for manual review. Flagged transactions are queued for async RAG+LLM investigation.
+- Amount > $10K: authorize on ML score, then flag for post-transaction investigation regardless of score.
+- The Decision Router does not invoke the LLM synchronously. It flags transactions for the async investigation queue.
+- During critical drift, routing thresholds can be adjusted to increase the proportion of transactions flagged for manual review.
 
 ### Embedding Service
 
@@ -238,10 +272,12 @@ Design priorities:
 
 ### LLM Assessor
 
-- Receives transaction text, ML fraud score, and reranked context.
+- Operates asynchronously, processing flagged transactions after the authorization decision has been made. Not in the real-time authorization path.
+- Receives transaction text, ML fraud score, and reranked context from the async investigation queue.
 - Uses GPT-4o at temperature 0.0 with fraud analyst system prompt.
-- Output: fraud_probability, risk_level, reasoning, matching_patterns, recommended_action, audit_trail.
-- Strict 2,000ms timeout. On timeout, reverts to ML-score-only with LLM-unavailable flag.
+- Output: investigation_summary, risk_level, reasoning, matching_patterns, analyst_recommendations, audit_trail.
+- Supports human analysts in manual review queues, chargeback defense preparation, and regulatory audit documentation.
+- On LLM unavailability, flagged transactions remain in the manual review queue for analyst review without LLM assistance.
 
 ### Embedding Sample Buffer
 
@@ -269,7 +305,7 @@ Design priorities:
 ### Fallback Controller
 
 - ML scorer failure: all transactions to rule-based fallback. Critical alert dispatched.
-- RAG+LLM failure: ML scorer continues for all transactions. Gray zone handled with adjusted thresholds or manual review routing.
+- RAG+LLM investigation failure: authorization path unaffected. Flagged transactions remain in manual review queue without LLM-generated investigation reports.
 - Recovery: dual-layer processing restored when drift returns to nominal or failed service recovers.
 
 ---
@@ -277,8 +313,8 @@ Design priorities:
 ## Data Flow
 
 ```
-                    NUMBERED DATA FLOW SEQUENCE
-                    ===========================
+                    REAL-TIME AUTHORIZATION FLOW (sub-50ms)
+                    =======================================
 
 [1] Payment Network
      |
@@ -294,33 +330,51 @@ Design priorities:
      v
 [5] Decision Router
      |                              |
-     | score<0.3 or score>0.7       | score 0.3-0.7, >$10K,
-     | (70-80% of txns)             | or explainability needed
-     |                              | (20-30% of txns)
-     v                              v
-[6a] Direct Decision           [6b] Embedding Service (384-dim default / 3072-dim optional)
-     |                              |
-     |                         [7]  +--> Sample Buffer (for drift monitoring)
-     |                              |
-     |                         [8]  Vector Store / ChromaDB (top-5 patterns, ~10ms)
-     |                              |
-     |                         [9]  Cross-Encoder Reranker (~50ms)
-     |                              |
-     |                         [10] LLM Assessor / GPT-4o (~1500ms)
+     | score<0.3 or score>0.7       | score 0.3-0.7, >$10K
+     | (70-80% of txns)             | (20-30% of txns)
      |                              |
      v                              v
-[11] Final Decision --> Payment Network
-     (approve | flag_for_review | decline | block)
+[6a] Direct Decision           [6b] Authorize with conservative
+     |                              thresholds + flag for review
+     |                              |
+     v                              v
+[7] Authorization Decision --> Payment Network
+     (approve | decline | flag_for_review)
+
+- - - - - - - - - - - - ASYNC BOUNDARY - - - - - - - - - - - -
+
+                    ASYNC INVESTIGATION FLOW (no latency SLA)
+                    ==========================================
+
+[8]  Flagged transactions --> Async Investigation Queue
+     |
+     v
+[9]  Embedding Service (384-dim default / 3072-dim optional)
+     |
+     +--> Sample Buffer (for drift monitoring)
+     |
+     v
+[10] Vector Store / ChromaDB (top-5 patterns, ~10ms)
+     |
+     v
+[11] Cross-Encoder Reranker (~50ms)
+     |
+     v
+[12] LLM Assessor / GPT-4o (~1500ms)
+     |
+     v
+[13] Investigation Report --> Analyst Review Queue
+     (investigation summary, reasoning, analyst recommendations, audit trail)
 
                     ASYNC MONITORING (parallel)
                     ===========================
 
-[12] LangSmith Trace Logging (every LLM-assessed transaction)
-[13] ML Feature Drift Monitor (every 15 min PSI/KS, hourly concept drift)
-[14] Embedding Drift Monitor (every 5-15 min, plus continuous CUSUM)
-[15] Drift Correlation Engine (cross-layer signal analysis)
-[16] Alert Router --> Slack / PagerDuty (if thresholds exceeded)
-[17] Fallback Controller (adjust processing mode if needed)
+[14] LangSmith Trace Logging (every LLM investigation run)
+[15] ML Feature Drift Monitor (every 15 min PSI/KS, hourly concept drift)
+[16] Embedding Drift Monitor (every 5-15 min, plus continuous CUSUM)
+[17] Drift Correlation Engine (cross-layer signal analysis)
+[18] Alert Router --> Slack / PagerDuty (if thresholds exceeded)
+[19] Fallback Controller (adjust processing mode if needed)
 ```
 
 ---
@@ -343,8 +397,8 @@ Design priorities:
 +----------------------------+-------------------+---------------------------------------------+
 | RAG Retrieval (ChromaDB)   | 3,000 QPS         | HNSW index lookup. In-memory.               |
 +----------------------------+-------------------+---------------------------------------------+
-| LLM Assessor (GPT-4o)     | 150 TPS            | LLM API rate limit. System bottleneck for   |
-|                            |                   | complement path. Only 20-30% of traffic.    |
+| LLM Assessor (GPT-4o)     | 150 TPS            | LLM API rate limit. Async investigation     |
+| (async)                    |                   | path only. Does not constrain authorization.|
 +----------------------------+-------------------+---------------------------------------------+
 | ML Feature Drift Monitor   | N/A (batch)       | Feature window processed in <2s.            |
 +----------------------------+-------------------+---------------------------------------------+
@@ -352,15 +406,15 @@ Design priorities:
 +----------------------------+-------------------+---------------------------------------------+
 ```
 
-The LLM assessor is the most expensive component per-transaction, but since it only processes a routed subset, it does not constrain overall throughput.
+The LLM assessor is the most expensive component per-transaction, but it operates asynchronously after the authorization decision. It does not sit in the authorization path and does not constrain authorization throughput or latency.
 
 ---
 
 ## Scalability Considerations
 
-- The ML scorer handles all transactions at high speed. Only 20-30% require the more expensive RAG+LLM processing.
+- The ML scorer handles all transactions at high speed within the sub-50ms authorization SLA. Authorization decisions are made entirely by the ML model and decision router.
 - Ingestion gateway, feature extraction, ML scorer, and decision router are stateless and horizontally scalable.
-- Embedding service and LLM assessor only serve the routed subset, reducing required capacity.
+- The RAG+LLM investigation pipeline operates asynchronously and only processes flagged transactions, decoupling investigation throughput from authorization throughput.
 - ChromaDB supports sharding. The fraud knowledge base (tens of thousands of patterns) does not require it. Reference embedding collection (50K+) benefits from in-memory indexing.
 - Both drift monitors are singleton services. Leader election ensures standby takeover if primary fails.
 
@@ -380,9 +434,9 @@ The LLM assessor is the most expensive component per-transaction, but since it o
 
 ### Embedding API Unavailable
 
-- RAG+LLM layer disabled. ML scorer continues for all transactions.
-- Gray zone transactions processed ML-score-only with adjusted thresholds or flagged for manual review.
-- Degraded but not critical.
+- Async RAG+LLM investigation pipeline disabled. Authorization path is unaffected since it relies solely on the ML scorer.
+- Flagged transactions remain in manual review queue but without LLM-generated investigation reports. Analysts review using ML scores and raw transaction data only.
+- Degraded investigation quality but not critical to authorization.
 
 ### Vector Store Unavailable
 
@@ -391,7 +445,8 @@ The LLM assessor is the most expensive component per-transaction, but since it o
 
 ### LLM API Unavailable
 
-- RAG+LLM layer disabled. ML scorer continues for all transactions.
+- Async investigation pipeline disabled. Authorization path is unaffected.
+- Flagged transactions remain in manual review queue without LLM-generated investigation reports.
 - Automatic transition, no human intervention required.
 
 ### Drift Monitor Failure
@@ -401,8 +456,8 @@ The LLM assessor is the most expensive component per-transaction, but since it o
 
 ### Cascading Failure Prevention
 
-- Critical transaction path (ingestion, feature extraction, ML scoring, routing) is isolated from RAG+LLM layer and monitoring plane.
-- Failure in RAG+LLM, drift monitors, LangSmith, or alert router does not affect primary scoring.
+- Critical authorization path (ingestion, feature extraction, ML scoring, routing) is fully isolated from the async RAG+LLM investigation pipeline and monitoring plane.
+- Failure in RAG+LLM investigation, drift monitors, LangSmith, or alert router does not affect real-time authorization decisions.
 - Circuit breakers at each external dependency boundary (embedding API, LLM API, ChromaDB, LangSmith).
 - ML scorer has no external API dependencies at inference time (model loaded locally).
 

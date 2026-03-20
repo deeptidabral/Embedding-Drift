@@ -11,7 +11,7 @@ Embedding drift never occurs in isolation. In a production dual-layer fraud dete
 ### Embedding Drift
 
 - A statistically significant change in the distribution of embedding vectors relative to a calibrated reference: D(P_ref, P_prod(t)) > threshold.
-- D can be cosine distance, MMD, KS statistic, Wasserstein distance, or PSI.
+- D is Maximum Mean Discrepancy (MMD) with an RBF kernel -- the recommended detection method for dense embedding spaces. See the drift metrics and thresholds document for the detailed rationale and why univariate, binning-based, and centroid-based alternatives are inappropriate.
 - Embedding drift is a symptom, not a root cause. Something upstream has changed.
 
 ### Concept Shift (Concept Drift)
@@ -113,8 +113,8 @@ The ML model operates on structured features. The complement layer operates on d
 +------------+--------------------------+------------------------------+-----------------------------+
 | Scenario   | Condition                | Business Impact              | Recommended Action          |
 +------------+--------------------------+------------------------------+-----------------------------+
-| A: ML OK,  | Embedding drift alerts   | System loses its safety net  | Remediate complement layer  |
-| Embed Drift| fire. ML metrics nominal.| for gray zone cases.         | (reindex, refresh           |
+| A: ML OK,  | MMD alert fires.         | System loses its safety net  | Remediate complement layer  |
+| Embed Drift| ML metrics nominal.      | for gray zone cases.         | (reindex, refresh           |
 |            | Cross-layer agreement    | Ambiguous transactions get   | reference). ML continues    |
 |            | declines.                | impaired second opinion.     | with conservative gray zone |
 |            |                          |                              | handling.                   |
@@ -124,15 +124,15 @@ The ML model operates on structured features. The complement layer operates on d
 |            | nominal. Gray zone       | Complement layer catches     | reference for changed        |
 |            | routing rate increases.  | ML model errors.             | routing patterns.           |
 +------------+--------------------------+------------------------------+-----------------------------+
-| C: Both    | Both drift metric        | Highest risk for financial   | Activate full rule-based    |
-| Drifting   | systems alert. Fraud     | loss. ML misroutes and RAG   | fallback. Investigate       |
-|            | detection rate and FPR   | fails to catch errors.       | common upstream cause.      |
-|            | degrade rapidly.         | Errors compound.             | Remediate ML first (higher  |
-|            |                          |                              | volume).                    |
+| C: Both    | MMD alert fires AND ML   | Highest risk for financial   | Activate full rule-based    |
+| Drifting   | feature drift alerts     | loss. ML misroutes and RAG   | fallback. Investigate       |
+|            | fire. Fraud detection    | fails to catch errors.       | common upstream cause.      |
+|            | rate and FPR degrade     | Errors compound.             | Remediate ML first (higher  |
+|            | rapidly.                 |                              | volume).                    |
 +------------+--------------------------+------------------------------+-----------------------------+
-| D: Neither | All drift metrics green. | Invisible to drift           | Outcome-based monitoring    |
-| Drifting   | Outcome metrics show     | monitoring. Labels have      | catches this. Retrain ML,   |
-|            | declining accuracy.      | changed while distributions  | update knowledge base,      |
+| D: Neither | MMD nominal. ML metrics  | Invisible to drift           | Outcome-based monitoring    |
+| Drifting   | nominal. Outcome metrics | monitoring. Labels have      | catches this. Retrain ML,   |
+|            | show declining accuracy. | changed while distributions  | update knowledge base,      |
 |            |                          | have not. Pure concept       | adjust LLM prompts.        |
 |            |                          | shift.                       | Requires human analyst.     |
 +------------+--------------------------+------------------------------+-----------------------------+
@@ -140,13 +140,13 @@ The ML model operates on structured features. The complement layer operates on d
 
 ## Diagnostic Framework
 
-When a drift alert fires, follow this decision tree to identify the shift type and affected layer(s).
+When an MMD alert fires, follow this decision tree to identify the shift type and affected layer(s). MMD tells you that drift has occurred and how severe it is; the diagnostic steps below determine why and where.
 
 ### Diagnostic Flowchart
 
 ```
                          +------------------+
-                         |  Alert Fires     |
+                         | MMD Alert Fires  |
                          +--------+---------+
                                   |
                     +-------------+-------------+
@@ -159,8 +159,8 @@ When a drift alert fires, follow this decision tree to identify the shift type a
        +-----------+-----------+               |
        |           |           |               |
   +----v----+ +----v----+ +----v----+   +------v------+
-  |Embedding| |ML Only  | | Both    |   | No Drift    |
-  |Only     | |         | | Layers  |   | Alerts, But |
+  |Embedding| |ML Only  | | Both    |   | No MMD      |
+  |MMD Only | |         | | Layers  |   | Alert, But  |
   +----+----+ +----+----+ +----+----+   | Performance |
        |           |           |        | Degrades    |
        |           |           |        +------+------+

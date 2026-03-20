@@ -2,10 +2,10 @@
 
 ## Overview
 
-- LangSmith serves as the centralized observability layer for the RAG complement layer in dual-layer fraud detection pipelines.
-- The primary ML model scores every transaction. The RAG+LLM complement layer is invoked selectively for gray zone cases (ML score 0.3-0.7), high-value transactions (>$10k), explainability needs, and novel pattern detection.
-- If embeddings drift from their reference distribution, retrieval quality silently degrades and the LLM makes fraud decisions on irrelevant context. This happens precisely for the transactions the ML model is least confident about.
-- LangSmith makes this degradation visible before it causes financial loss.
+- LangSmith serves as the centralized observability layer for the async RAG+LLM investigation pipeline in the dual-layer fraud detection system. It monitors the investigation path, not the real-time authorization path.
+- The primary ML model scores every transaction and drives real-time authorization decisions (sub-10ms, sub-50ms end-to-end). Flagged transactions (gray zone, high-value) are queued for async investigation by the RAG+LLM pipeline, which generates investigation reports, analyst recommendations, and audit documentation to support human analysts in manual review queues.
+- If embeddings drift from their reference distribution, retrieval quality silently degrades and the LLM generates investigation reports based on irrelevant context. This degrades the quality of manual review for the transactions the ML model flagged as uncertain.
+- LangSmith makes this investigation quality degradation visible before it leads to missed fraud in manual review or weak chargeback defense.
 
 ---
 
@@ -14,28 +14,42 @@
 ### Where LangSmith Sits
 
 ```
+          REAL-TIME AUTHORIZATION PATH (sub-50ms SLA)
+          ============================================
+
 +------------------+     +-------------------+     +-------------------+
-| Transaction      |     | Primary ML Model  |     | Routing Decision  |
-| Ingestion        | --> | (XGBoost)         | --> |                   |
+| Transaction      |     | Primary ML Model  |     | Decision Router   |
+| Ingestion        | --> | (XGBoost, <10ms)  | --> | (authorize + flag)|
 +------------------+     +-------------------+     +-------------------+
                                                           |
                          +--------------------------------+----------------+
-                         |                                |                |
-                         v                                v                v
-                  +--------------+               +--------------+  +--------------+
-                  | Auto-Approve |               | Complement   |  | Auto-Decline |
-                  | (score <0.3) |               | Layer (RAG   |  | (score >0.7) |
-                  +--------------+               | + LLM)       |  +--------------+
-                                                 +--------------+
-                                                        |
+                         |                                                 |
+                         v                                                 v
+                  +--------------+                              +-------------------+
+                  | Auto-Approve |                              | Authorize + Flag  |
+                  | or Decline   |                              | for Manual Review |
+                  | (ML score    |                              | (gray zone,       |
+                  |  alone)      |                              |  high-value)      |
+                  +--------------+                              +-------------------+
+                                                                           |
+- - - - - - - - - - - - - - - - - ASYNC BOUNDARY - - - - - - - - - - - - -+- -
+                                                                           |
+          ASYNC INVESTIGATION PATH (no latency SLA)                        |
+          ==========================================                       v
+                                                               +-------------------+
+                                                               | Async             |
+                                                               | Investigation     |
+                                                               | Queue             |
+                                                               +-------------------+
+                                                                        |
                     +-----------------------------------+-------------------+
                     |                  |                 |                   |
                     v                  v                 v                   v
              +------------+    +-------------+   +--------------+   +-------------+
-             | Text       |    | Embedding   |   | Vector       |   | LLM Risk    |
-             | Rendering  |    | Generation  |   | Retrieval    |   | Assessment  |
-             +------------+    +-------------+   +--------------+   +-------------+
-                                     |
+             | Text       |    | Embedding   |   | Vector       |   | LLM         |
+             | Rendering  |    | Generation  |   | Retrieval    |   | Investigation|
+             +------------+    +-------------+   +--------------+   | Report      |
+                                     |                              +-------------+
                                      |  (sampled embeddings)
                                      v
                           +---------------------+
@@ -48,17 +62,17 @@
                           +---------------------+
 ```
 
-- Every transaction first passes through the primary ML model, which produces a fraud probability score.
-- Confident decisions (scores below 0.3 or above 0.7) bypass the complement layer entirely.
-- Gray zone, high-value, and explainability-required cases route to the RAG+LLM complement layer.
-- LangSmith wraps the complement layer chain as a traced run, with each stage as a child span. The ML model score and routing decision are recorded as metadata for cross-layer correlation.
-- The drift monitor operates as a parallel observer. It does not sit in the transaction processing critical path. It samples embeddings, computes drift statistics, and reports them as custom feedback scores.
+- Every transaction first passes through the primary ML model, which produces a fraud probability score and drives the real-time authorization decision.
+- Confident decisions (scores below 0.3 or above 0.7) are authorized on the ML score alone.
+- Gray zone and high-value transactions are authorized (with conservative thresholds) and flagged for manual review. Flagged transactions are queued for async RAG+LLM investigation.
+- LangSmith traces the async investigation pipeline, not the real-time authorization path. Each investigation run is logged as a traced run, with each stage (text rendering, embedding, retrieval, LLM assessment) as a child span. The ML model score and routing decision are recorded as metadata for cross-layer correlation.
+- LangSmith monitors investigation quality, not authorization latency. The drift monitor operates as a parallel observer on the async path. It samples embeddings, computes drift statistics, and reports them as custom feedback scores.
 
 ### Integration Points
 
-- **Run tracing**: every complement layer assessment is logged as a LangSmith run (raw transaction text, embedding vector, retrieved documents, LLM output).
-- **Custom evaluators**: asynchronous evaluators consume batches of recent runs, compute drift statistics against the reference distribution, and post results as feedback scores.
-- **Dashboard and alerting**: dashboard panels visualize drift over time. Threshold-based alerts trigger Slack and PagerDuty notifications.
+- **Run tracing**: every async investigation run is logged as a LangSmith run (raw transaction text, embedding vector, retrieved documents, LLM-generated investigation report). This traces the investigation pipeline, not the authorization path.
+- **Custom evaluators**: asynchronous evaluators consume batches of recent investigation runs, compute drift statistics against the reference distribution, and post results as feedback scores.
+- **Dashboard and alerting**: dashboard panels visualize investigation quality and drift over time. Threshold-based alerts trigger Slack and PagerDuty notifications when investigation quality degrades.
 
 ---
 
@@ -77,9 +91,13 @@ os.environ["LANGCHAIN_PROJECT"] = "fraud-detection-embedding-drift"
 ls_client = Client()
 
 
-@traceable(name="fraud-assessment-complement", run_type="chain")
-def assess_transaction_complement(transaction: dict, ml_score: float) -> dict:
-    """RAG+LLM complement layer assessment for transactions routed from the ML model."""
+@traceable(name="fraud-investigation-async", run_type="chain")
+def investigate_flagged_transaction(transaction: dict, ml_score: float) -> dict:
+    """Async RAG+LLM investigation for transactions flagged during authorization.
+
+    This runs asynchronously after the authorization decision has been made.
+    It generates investigation reports to assist human analysts in manual review.
+    """
 
     # Stage 1: Render the transaction into text
     transaction_text = render_transaction_template(transaction)
@@ -87,7 +105,7 @@ def assess_transaction_complement(transaction: dict, ml_score: float) -> dict:
     # Stage 2: Generate embedding
     embedding = generate_embedding(transaction_text)
 
-    # Attach embedding and ML model context to the run for downstream drift analysis
+    # Attach embedding and ML model context to the investigation run for drift analysis
     run_tree = get_current_run_tree()
     if run_tree:
         run_tree.metadata["embedding_vector"] = embedding.tolist()
@@ -106,7 +124,7 @@ def assess_transaction_complement(transaction: dict, ml_score: float) -> dict:
 
 
 def classify_routing_reason(transaction: dict, ml_score: float) -> str:
-    """Determine why this transaction was routed to the complement layer."""
+    """Determine why this transaction was flagged for async investigation."""
     if 0.3 <= ml_score <= 0.7:
         return "gray_zone"
     elif transaction["amount"] > 10000:
@@ -135,8 +153,9 @@ def retrieve_fraud_patterns(embedding, top_k: int = 5):
     return results
 ```
 
-- Each call produces a full trace with child spans for embedding generation and retrieval.
-- The embedding vector, ML score, and routing reason are stored in run metadata for batch drift evaluation and cross-layer correlation.
+- Each async investigation run produces a full trace with child spans for embedding generation and retrieval.
+- The embedding vector, ML score, and flagging reason are stored in run metadata for batch drift evaluation and cross-layer correlation.
+- These traces monitor the async investigation pipeline, not the real-time authorization path. Authorization latency is tracked separately in the ML model's own monitoring infrastructure.
 
 ---
 
@@ -247,7 +266,7 @@ def evaluate_recent_drift(lookback_minutes: int = 5):
 
 ## Dashboard Design
 
-Four sections. The first three cover complement layer embedding drift. The fourth provides cross-layer visibility between the ML model and complement layer.
+Four sections. The first three cover async investigation pipeline embedding drift and investigation quality. The fourth provides cross-layer visibility between the ML authorization model and the async investigation pipeline. LangSmith monitors investigation quality, not authorization latency.
 
 ### Dashboard Panel Summary
 
@@ -315,21 +334,21 @@ Four sections. The first three cover complement layer embedding drift. The fourt
 
 - **Panel 9. ML Score Distribution for Routed Transactions**: histogram of ML scores for complement-layer transactions. A widening gray zone suggests ML feature drift. A stable zone with poor complement outcomes points to embedding drift.
 - **Panel 10. Gray Zone Routing Rate Over Time**: percentage of transactions routed to complement layer by reason. Rising rate means the ML model is becoming less decisive. Stable rate with declining accuracy means embedding drift.
-- **Panel 11. ML/LLM Agreement Rate**: tracks how often the LLM assessment aligns with the ML score direction. Declining agreement with a stable ML distribution suggests embedding drift. Declining agreement with a shifting ML distribution suggests ML feature drift.
+- **Panel 11. ML/LLM Agreement Rate**: tracks how often the async LLM investigation assessment aligns with the ML score direction. Declining agreement with a stable ML distribution suggests embedding drift in the investigation pipeline. Declining agreement with a shifting ML distribution suggests ML feature drift in the authorization model.
 - **Panel 12. Embedding Drift vs ML Feature Drift Correlation**: dual-axis time-series of embedding drift and ML feature drift (e.g., mean PSI across top features). Correlated movement indicates a common upstream cause. Divergent movement isolates which layer is degrading.
 
 ---
 
 ## Correlating Drift with Retrieval Quality and Fraud Detection Accuracy
 
-- The value of drift monitoring is its ability to predict downstream degradation.
+- The value of drift monitoring is its ability to predict downstream degradation in the async investigation pipeline.
 - For each evaluation window, record three values.
   - Aggregate drift score (cosine distance, MMD, or ensemble severity).
-  - Mean retrieval relevance (average cosine similarity between query embedding and top-k retrieved documents).
-  - Fraud detection accuracy (from chargeback data and manual review, typically 30-90 day lag).
+  - Mean retrieval relevance (average cosine similarity between query embedding and top-k retrieved documents in the investigation pipeline).
+  - Investigation quality (from chargeback outcomes, manual review analyst feedback, and post-hoc accuracy assessment, typically 30-90 day lag).
 - Two correlation modes exist.
-  - **Real-time**: correlates drift with retrieval relevance (available immediately).
-  - **Retrospective** (weekly/monthly): joins drift scores with actual fraud labels to validate that drift alerts corresponded to genuine accuracy degradation.
+  - **Near-real-time**: correlates drift with retrieval relevance in the investigation pipeline (available immediately after each async investigation run).
+  - **Retrospective** (weekly/monthly): joins drift scores with actual fraud labels and manual review outcomes to validate that drift alerts corresponded to genuine investigation quality degradation.
 
 ```python
 def compute_drift_retrieval_correlation(lookback_hours: int = 24):
@@ -490,7 +509,7 @@ def should_send_alert(severity: str, metric_name: str) -> bool:
 
 ## Complementing LangSmith with Evidently AI
 
-- LangSmith excels at real-time LLM observability (tracing, custom feedback scores, live dashboards) but is not a native drift detection engine. It visualizes drift scores computed externally.
+- LangSmith excels at observability for the async LLM investigation pipeline (tracing, custom feedback scores, live dashboards) but is not a native drift detection engine. It visualizes drift scores computed externally. It monitors investigation quality, not real-time authorization performance.
 - Evidently AI fills this gap. It is free, open-source (Apache 2.0), and provides built-in statistical drift detection with publication-quality HTML reports.
 
 ### LangSmith vs Evidently AI Capabilities
@@ -531,7 +550,7 @@ def should_send_alert(severity: str, metric_name: str) -> bool:
 
 ### Division of Responsibilities
 
-- **LangSmith**: continuous, real-time monitoring. Every complement layer transaction traced. Rolling drift scores attached to runs. Alerts on threshold breach.
+- **LangSmith**: continuous monitoring of the async investigation pipeline. Every investigation run traced. Rolling drift scores attached to runs. Alerts on threshold breach. Monitors investigation quality, not authorization latency.
 - **Evidently**: periodic deep-dive analysis (hourly/daily). Comprehensive drift reports with per-feature statistical tests, embedding distribution comparisons, and visual diagnostics. Standalone HTML reports for stakeholders, incident tickets, and regulatory archives.
 
 ### Evidently Integration Points
@@ -584,6 +603,6 @@ drift_report = reporter.to_drift_report(embedding_summary)
 
 ### When to Use Each Tool
 
-- **LangSmith**: real-time operational monitoring of every LLM call, continuous per-minute drift tracking, per-transaction retrieval quality correlation, trace-level debugging.
+- **LangSmith**: operational monitoring of every async LLM investigation run, continuous per-minute drift tracking on the investigation pipeline, per-investigation retrieval quality correlation, trace-level debugging of investigation reports. Does not monitor authorization latency.
 - **Evidently**: hourly/daily deep-dive reports, stakeholder-facing HTML with visual diagnostics, per-feature drill-down for ML model inputs, dual-layer compound assessment, CI/CD pass/fail test suites, regulatory audit artifacts.
-- In production, both run simultaneously. LangSmith provides the live pulse. Evidently provides the periodic health examination.
+- In production, both run simultaneously. LangSmith provides the live pulse on investigation quality. Evidently provides the periodic health examination across both layers.

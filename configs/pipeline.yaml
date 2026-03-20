@@ -1,10 +1,10 @@
 # Fraud Detection Pipeline Configuration
-# Dual-layer fraud detection: ML model primary scoring with RAG+LLM complementary analysis
+# Dual-layer fraud detection: ML model primary scoring with async RAG+LLM post-transaction investigation
 
 pipeline:
   name: "fraud-detection-dual-layer"
   version: "2.0.0"
-  description: "Dual-layer fraud detection: ML model primary scoring with RAG+LLM complementary analysis"
+  description: "Dual-layer fraud detection: ML model primary scoring with async RAG+LLM post-transaction investigation"
 
 # ---------------------------------------------------------------------------
 # Primary scorer -- gradient boosted trees (XGBoost)
@@ -79,7 +79,7 @@ vector_store:
     ef_search: 100
 
 # ---------------------------------------------------------------------------
-# Retrieval settings (complementary layer -- invoked selectively)
+# Retrieval settings (async post-transaction investigation layer)
 # ---------------------------------------------------------------------------
 
 retrieval:
@@ -89,7 +89,7 @@ retrieval:
   reranking_model: "cross-encoder/ms-marco-MiniLM-L-12-v2"
 
 # ---------------------------------------------------------------------------
-# LLM settings (complementary layer -- invoked selectively)
+# LLM settings (async post-transaction investigation layer -- not real-time authorization)
 # ---------------------------------------------------------------------------
 
 llm:
@@ -97,19 +97,23 @@ llm:
   temperature: 0.0
   max_tokens: 1024
   system_prompt: |
-    You are a fraud detection analyst providing complementary analysis to a
-    primary ML scoring model at a major payment processor.  The ML model has
-    already produced a fraud probability score for this transaction.  Your
-    role is to:
+    You are a post-transaction fraud investigation analyst. You operate
+    asynchronously -- the authorization decision has already been made by the
+    primary ML scoring model. Your analysis is NOT part of the real-time
+    transaction authorization flow. Instead, you provide after-the-fact
+    investigation for flagged transactions. Your role is to:
       1. Provide explainability -- generate a clear, human-readable rationale
-         for why the transaction is suspicious or legitimate.
-      2. Identify novel patterns -- surface historical fraud patterns that
-         the ML model may not have captured in its feature set.
+         for why the transaction was flagged as suspicious or appears
+         legitimate, supporting human investigators.
+      2. Identify novel patterns -- surface historical fraud patterns from the
+         knowledge base that the ML model may not have captured, informing
+         future model retraining and rule updates.
       3. Support audit trails -- produce structured reasoning suitable for
-         regulatory compliance documentation.
+         regulatory compliance documentation and dispute resolution.
     Analyze the provided transaction against historical fraud patterns
-    retrieved from the knowledge base and produce a structured risk
-    assessment that complements the ML model output.
+    retrieved from the knowledge base and produce a structured investigation
+    report. This report will be reviewed by human fraud analysts, not used
+    for real-time decisioning.
 
   response_schema:
     fraud_probability: "float between 0.0 and 1.0"

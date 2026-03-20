@@ -1,26 +1,19 @@
 """
-Drift detection algorithms and ensemble detectors.
+Drift detection using Maximum Mean Discrepancy (MMD).
 
-Includes pure statistical metric functions (cosine distance, MMD,
-KS test, Wasserstein distance, PSI) and an ensemble-based detector
-that combines multiple metrics with configurable severity thresholds.
+MMD is the sole drift metric because dense embedding dimensions are
+highly entangled.  Univariate tests (KS per dimension) suffer from
+massive multiple-testing problems and miss multivariate rotations.
+Cosine distance only captures mean shift.  PCA explained-variance
+comparisons miss mean shift entirely.  Only MMD correctly assesses the
+full high-dimensional distribution.
 """
 
-from src.drift_detection.metrics import (
-    cosine_distance_drift,
-    kolmogorov_smirnov_per_component,
-    maximum_mean_discrepancy,
-    population_stability_index,
-    wasserstein_distance_drift,
-)
+from src.drift_detection.metrics import maximum_mean_discrepancy
 from src.drift_detection.detectors import DriftReport, EmbeddingDriftDetector
 
 __all__ = [
-    "cosine_distance_drift",
-    "kolmogorov_smirnov_per_component",
     "maximum_mean_discrepancy",
-    "population_stability_index",
-    "wasserstein_distance_drift",
     "DriftReport",
     "EmbeddingDriftDetector",
 ]
