@@ -497,7 +497,7 @@ def should_send_alert(severity: str, metric_name: str) -> bool:
 
 - Drift computation runs entirely asynchronously. Zero latency added to transaction processing.
 - Embeddings are logged to run metadata during processing (negligible overhead). The drift evaluator pulls them in batch on a 5-minute schedule.
-- Storage overhead: approximately 3 KB per transaction for a 384-dimensional embedding (64-bit floats). If using OpenAI text-embedding-3-large (3,072 dimensions), overhead increases to approximately 24 KB.
+- Storage overhead: approximately 3 KB per transaction for a 384-dimensional embedding (64-bit floats).
 
 ### Compliance and Auditability
 

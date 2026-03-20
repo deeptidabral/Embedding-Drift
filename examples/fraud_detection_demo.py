@@ -397,7 +397,7 @@ def llm_assess_fraud(
     """Simulate a RAG+LLM fraud assessment.
 
     In production, this retrieves similar fraud patterns from ChromaDB
-    and sends the transaction context to GPT-4o for structured analysis.
+    and sends the transaction context to Ollama phi3:mini for structured analysis.
     """
     amount = txn["amount"]
     ml_score = ml_result["ml_score"]

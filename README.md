@@ -304,7 +304,7 @@ Or install dependencies directly:
 pip install -r requirements.txt
 ```
 
-**Note:** The project runs fully locally with no API keys required. The default embedding model is sentence-transformers (all-MiniLM-L6-v2), which runs on your machine at no cost. To use OpenAI text-embedding-3-large as an optional production backend, set the `OPENAI_API_KEY` environment variable and update the configuration accordingly.
+**Note:** The project runs fully locally with no API keys required. The embedding model is sentence-transformers (all-MiniLM-L6-v2), which runs on your machine at no cost.
 
 **Note on embedding approach:** This project uses text embedding models (sentence-transformers) as a simplified demonstration of drift monitoring concepts. In production, structured tabular transaction data (amounts, MCCs, coordinates) would be embedded using Deep Entity Embeddings, Autoencoders, or Graph Neural Networks (GNNs), which properly capture numerical magnitudes and geospatial relationships. The drift monitoring framework and statistical methods demonstrated here transfer directly to any embedding type.
 
@@ -338,9 +338,9 @@ ml_scorer:
   high_value_threshold: 10000
 
 embedding_model:
-  provider: openai
-  model_name: text-embedding-3-large
-  dimension: 3072
+  provider: sentence-transformers
+  model_name: all-MiniLM-L6-v2
+  dimension: 384
 
 vector_database:
   provider: pinecone
@@ -408,9 +408,9 @@ python examples/drift_monitoring_demo.py
 | Component              | Technology                                    | Purpose                                           |
 |------------------------|-----------------------------------------------|---------------------------------------------------|
 | ML Scoring Model       | XGBoost, scikit-learn                         | Primary fraud probability scoring for all transactions |
-| Embedding Models       | sentence-transformers (all-MiniLM-L6-v2), OpenAI text-embedding-3-large (optional) | Transaction text to vector conversion for RAG layer |
+| Embedding Models       | sentence-transformers (all-MiniLM-L6-v2)              | Transaction text to vector conversion for RAG layer |
 | Vector Database        | ChromaDB                                      | Storage and retrieval of transaction embeddings    |
-| LLM Inference          | GPT-4o                                        | Async post-transaction investigation, analyst co-pilot for manual review, chargeback defense, and audit documentation |
+| LLM Inference          | Ollama (phi3:mini)                            | Async post-transaction investigation, analyst co-pilot for manual review, chargeback defense, and audit documentation |
 | Statistical Computing  | NumPy, SciPy, scikit-learn                    | Drift detection computations for both layers       |
 | Drift Monitoring       | Evidently AI, alibi-detect                    | Statistical drift reports and advanced detection   |
 | LLM Observability      | LangSmith                                     | Async investigation pipeline tracing, evaluation, and dashboards |

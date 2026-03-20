@@ -46,7 +46,7 @@ decision_routing:
 embedding:
   model: "all-MiniLM-L6-v2"
   dimensions: 384
-  backend: "sentence-transformers"  # Alternative: "openai" (requires OPENAI_API_KEY)
+  backend: "sentence-transformers"
   batch_size: 128
   max_retries: 3
   timeout_seconds: 30
@@ -93,7 +93,7 @@ retrieval:
 # ---------------------------------------------------------------------------
 
 llm:
-  model: "gpt-4o"
+  model: "ollama/phi3:mini"
   temperature: 0.0
   max_tokens: 1024
   system_prompt: |

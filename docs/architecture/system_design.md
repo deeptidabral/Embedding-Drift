@@ -83,8 +83,8 @@ Design priorities:
               |  RAG+LLM Investigation      |
               |                             |
               |  Embedding Service          |
-              |  (all-MiniLM-L6-v2 default; |
-              |   text-embed-3-large opt.)  |
+              |  (all-MiniLM-L6-v2,        |
+              |   384-dim, local)           |
               |         |                   |
               |         v                   |
               |  Vector Store (ChromaDB)    |
@@ -94,7 +94,8 @@ Design priorities:
               |  RAG Retriever + Reranker   |
               |         |                   |
               |         v                   |
-              |  LLM Assessor (GPT-4o)      |
+              |  LLM Assessor               |
+              |  (Ollama phi3:mini)         |
               |                             |
               |  Output:                    |
               |  - investigation_summary    |
@@ -184,10 +185,8 @@ Design priorities:
 |                            | (authorize + flag)        |           | decision path. No flagging. |
 +----------------------------+---------------------------+-----------+-----------------------------+
 | Embedding Service          | sentence-transformers     | ~50ms     | ML-score-only decision.     |
-|                            | all-MiniLM-L6-v2 (default,| (local)   | Falls back to ML-only.      |
-|                            | 384-dim, local) or        | ~100ms    | 30s timeout, 3 retries      |
-|                            | text-embedding-3-large    | (API)     | (OpenAI API path).          |
-|                            | (optional, 3072-dim)      |           |                             |
+|                            | all-MiniLM-L6-v2          | (local)   | Falls back to ML-only.      |
+|                            | (384-dim, local)          |           |                             |
 +----------------------------+---------------------------+-----------+-----------------------------+
 | Vector Store               | ChromaDB (HNSW, m=32,     | ~10ms     | In-memory cache of top 500  |
 |                            | ef_search=100, cosine)    |           | patterns. Then ML-only.     |
@@ -195,8 +194,8 @@ Design priorities:
 | RAG Retriever + Reranker   | Top-5 + ms-marco-MiniLM  | ~50ms     | Skip reranking. Use raw     |
 |                            | cross-encoder reranker    |           | retrieval results.          |
 +----------------------------+---------------------------+-----------+-----------------------------+
-| LLM Assessor               | GPT-4o (temp 0.0)        | ~1500ms   | Flagged txns remain in      |
-| (async investigation)      |                           | (async)   | manual review queue without |
+| LLM Assessor               | Ollama phi3:mini          | ~1500ms   | Flagged txns remain in      |
+| (async investigation)      | (temp 0.0)                | (async)   | manual review queue without |
 |                            |                           |           | LLM assistance.             |
 +----------------------------+---------------------------+-----------+-----------------------------+
 | Embedding Sample Buffer    | Ring buffer (20K entries,  | <0.1ms   | Drift monitor suspends.     |
@@ -254,10 +253,8 @@ Design priorities:
 
 ### Embedding Service
 
-- Defaults to sentence-transformers all-MiniLM-L6-v2, which produces 384-dimensional vectors locally with no API key required.
-- OpenAI text-embedding-3-large (3,072 dimensions) is available as an optional production backend for higher-fidelity embeddings.
-- Local model operates in micro-batches; OpenAI path uses micro-batches of up to 128 txns per API call.
-- Config (OpenAI path): 30s timeout, 3 retries with exponential backoff. On failure, reverts to ML-score-only decision.
+- Uses sentence-transformers all-MiniLM-L6-v2, which produces 384-dimensional vectors locally with no API key required.
+- Operates in micro-batches for throughput. On failure, reverts to ML-score-only decision.
 - Writes each embedding to the sample buffer for async drift monitoring.
 
 ### Vector Store (ChromaDB)
@@ -274,7 +271,7 @@ Design priorities:
 
 - Operates asynchronously, processing flagged transactions after the authorization decision has been made. Not in the real-time authorization path.
 - Receives transaction text, ML fraud score, and reranked context from the async investigation queue.
-- Uses GPT-4o at temperature 0.0 with fraud analyst system prompt.
+- Uses Ollama phi3:mini at temperature 0.0 with fraud analyst system prompt.
 - Output: investigation_summary, risk_level, reasoning, matching_patterns, analyst_recommendations, audit_trail.
 - Supports human analysts in manual review queues, chargeback defense preparation, and regulatory audit documentation.
 - On LLM unavailability, flagged transactions remain in the manual review queue for analyst review without LLM assistance.
@@ -349,7 +346,7 @@ Design priorities:
 [8]  Flagged transactions --> Async Investigation Queue
      |
      v
-[9]  Embedding Service (384-dim default / 3072-dim optional)
+[9]  Embedding Service (all-MiniLM-L6-v2, 384-dim, local)
      |
      +--> Sample Buffer (for drift monitoring)
      |
@@ -360,7 +357,7 @@ Design priorities:
 [11] Cross-Encoder Reranker (~50ms)
      |
      v
-[12] LLM Assessor / GPT-4o (~1500ms)
+[12] LLM Assessor / Ollama phi3:mini (~1500ms)
      |
      v
 [13] Investigation Report --> Analyst Review Queue
@@ -393,12 +390,12 @@ Design priorities:
 +----------------------------+-------------------+---------------------------------------------+
 | Decision Router            | 5,000 TPS         | Stateless logic. No bottleneck.             |
 +----------------------------+-------------------+---------------------------------------------+
-| Embedding Service          | 1,000 TPS         | External API call. Only 20-30% of traffic.  |
+| Embedding Service          | 1,000 TPS         | Local model inference. Only 20-30% of traffic.|
 +----------------------------+-------------------+---------------------------------------------+
 | RAG Retrieval (ChromaDB)   | 3,000 QPS         | HNSW index lookup. In-memory.               |
 +----------------------------+-------------------+---------------------------------------------+
-| LLM Assessor (GPT-4o)     | 150 TPS            | LLM API rate limit. Async investigation     |
-| (async)                    |                   | path only. Does not constrain authorization.|
+| LLM Assessor               | 150 TPS           | Local LLM inference. Async investigation    |
+| (Ollama phi3:mini, async)  |                   | path only. Does not constrain authorization.|
 +----------------------------+-------------------+---------------------------------------------+
 | ML Feature Drift Monitor   | N/A (batch)       | Feature window processed in <2s.            |
 +----------------------------+-------------------+---------------------------------------------+
@@ -471,5 +468,5 @@ The LLM assessor is the most expensive component per-transaction, but it operate
 - Sample buffer: stores only embedding vectors and non-sensitive metadata (merchant category, amount band, geography).
 - Reference snapshots: versioned and access-controlled. Retained for regulatory audit.
 - Network: all inter-service communication uses mutual TLS.
-- Secrets: API keys (OpenAI if used, LangSmith) in secrets manager, rotated on 90-day cycle. The default local embedding model (sentence-transformers) requires no API key.
+- Secrets: API keys (LangSmith) in secrets manager, rotated on 90-day cycle. Embedding model and LLM run locally with no external API keys.
 - Model integrity: ML model binary signed and verified at load time.

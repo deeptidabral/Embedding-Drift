@@ -14,8 +14,8 @@
 - A learned function that maps inputs into a fixed-length numeric vector, typically 384 to 3072 dimensions.
 - Semantically similar inputs land close together in vector space. Dissimilar inputs land far apart.
 - In payments, the input is a transaction record (merchant, amount, location, cardholder profile) and the output is a vector where transactions with similar risk profiles are geometrically proximate.
-- Common production dimensions: 384 (all-MiniLM-L6-v2), 768 (BERT-based), 1536 (text-embedding-ada-002), 3072 (text-embedding-3-large).
-- This project defaults to sentence-transformers all-MiniLM-L6-v2 (384 dimensions) for local execution, with no API key required. OpenAI text-embedding-3-large (3072 dimensions) is available as a production alternative.
+- Common production dimensions: 384 (all-MiniLM-L6-v2), 768 (BERT-based).
+- This project uses sentence-transformers all-MiniLM-L6-v2 (384 dimensions) for local execution, with no API key required.
 - Higher dimensions capture finer distinctions but cost more in storage, compute, and training data.
 
 ### Embedding Transformation Pipeline
@@ -25,10 +25,10 @@
 | Raw Transaction Data    |       | Text Serialization   |       | Embedding Model |       | Dense Vector                |
 |                         | ----> |                      | ----> |                 | ----> |                             |
 | amt: $247.83            |       | "Transaction:        |       | all-MiniLM-L6-v2|       | [0.12, -0.45, 0.78, 0.03,  |
-| merchant: BEST BUY     |       |  $247.83 USD at      |       | (default) or    |       |  -0.91, 0.34, ..., 0.07]   |
-| mcc: 5732               |       |  BEST BUY #0423      |       | text-embedding- |       |                             |
-| city: New York, NY      |       |  (MCC 5732:          |       | 3-large         |       | 384 dimensions (default),   |
-| terminal: POS chip-read |       |  Electronics)..."    |       | (optional)      |       | L2-normalized               |
+| merchant: BEST BUY     |       |  $247.83 USD at      |       |                 |       |  -0.91, 0.34, ..., 0.07]   |
+| mcc: 5732               |       |  BEST BUY #0423      |       |                 |       |                             |
+| city: New York, NY      |       |  (MCC 5732:          |       |                 |       | 384 dimensions,             |
+| terminal: POS chip-read |       |  Electronics)..."    |       |                 |       | L2-normalized               |
 +-------------------------+       +----------------------+       +-----------------+       +-----------------------------+
 ```
 
@@ -54,10 +54,10 @@
 ```
 +------------------+     +-------------------+     +-----------------------+     +-------------------+
 | Incoming         |     | Embed Transaction |     | Vector Database       |     | LLM Risk          |
-| Transaction      | --> | (all-MiniLM-L6-v2 | --> | Query (ANN search,    | --> | Assessment        |
-| (gray zone,      |     |  default, or      |     |  k=20 neighbors,      |     | (weigh retrieved  |
-|  high-value, or  |     |  text-embedding-  |     |  MCC + time filters)  |     |  cases, produce   |
-|  novel pattern)  |     |  3-large)         |     |                       |     |  score + reason)  |
+| Transaction      | --> | (all-MiniLM-L6-v2)| --> | Query (ANN search,    | --> | Assessment        |
+| (gray zone,      |     |                   |     |  k=20 neighbors,      |     | (weigh retrieved  |
+|  high-value, or  |     |                   |     |  MCC + time filters)  |     |  cases, produce   |
+|  novel pattern)  |     |                   |     |                       |     |  score + reason)  |
 |                  |     | Output: 384-dim   |     | Output: 20 similar    |     |                   |
 |                  |     |                   |     | labeled transactions  |     | Output: risk      |
 |                  |     |                   |     | with fraud labels     |     | score, decision,  |
@@ -166,7 +166,7 @@ Recent activity: 4 transactions in past 24h (3 gas, 1 online retail)
 
 ### Stage 3: Post-Processing
 
-- Dimensionality reduction (PCA or learned projection, e.g. 384 to 128 or 3072 to 256) for storage efficiency.
+- Dimensionality reduction (PCA or learned projection, e.g. 384 to 128) for storage efficiency.
 - Quantization (32-bit to 8-bit) for faster similarity computation.
 - Optional concatenation with engineered numeric features (amount, velocity counters).
 
@@ -324,7 +324,7 @@ Cardholder: 8-year tenure, $4,100/mo avg spend
 Past 24h: 1 transaction (grocery, $67.50)
 ```
 
-- Embedded via all-MiniLM-L6-v2 (default, 384 dimensions) or text-embedding-3-large (optional, 3072 dimensions) into a dense vector.
+- Embedded via all-MiniLM-L6-v2 (384 dimensions) into a dense vector.
 - Vector database query returns: similar legitimate luxury purchases from comparable profiles, known fraud at luxury retailers with stolen cards, and same-cardholder history at similar merchants.
 - LLM weighs risk factors: high tenure, chip auth, and geographic consistency reduce risk. High amount at a luxury retailer (common fraud target) increases it.
 
@@ -391,7 +391,7 @@ This project uses the Sparkov Credit Card Fraud Detection dataset as its primary
 
 ## Limitations of Text Embeddings for Tabular Transaction Data
 
-Text embedding models (sentence-transformers, OpenAI text-embedding-3-large, and similar NLP models) are designed for natural language and are not the right tool for embedding structured tabular transaction data in production. Key limitations include:
+Text embedding models (sentence-transformers and similar NLP models) are designed for natural language and are not the right tool for embedding structured tabular transaction data in production. Key limitations include:
 
 - **Numerical magnitudes:** NLP models tokenize numbers as character sequences, not as continuous values. The difference between "$50" and "$5,000" is not encoded proportionally. A text embedding model has no concept of numerical scale -- it treats "$100" and "$10,000" as sequences of characters that happen to share some tokens, not as quantities with a 100x difference.
 - **Geospatial relationships:** Latitude/longitude pairs serialized as text do not encode actual geographic distance. Two transactions 5 miles apart and two transactions 500 miles apart may produce similar cosine distances in text embedding space because the model has no geometric understanding of coordinates.
@@ -411,7 +411,7 @@ Text embedding models remain appropriate for unstructured text fields that arise
 
 ### This Project's Approach
 
-This project uses text embeddings (sentence-transformers all-MiniLM-L6-v2) as a **simplified demonstration** of drift monitoring concepts. The choice is deliberate: text embeddings are easy to generate locally with no API keys, the Sparkov dataset is readily available, and the drift monitoring framework is the focus -- not the embedding architecture.
+This project uses text embeddings (sentence-transformers all-MiniLM-L6-v2) as a **simplified demonstration** of drift monitoring concepts. The choice is deliberate: text embeddings are easy to generate locally with no API keys or external services, the Sparkov dataset is readily available, and the drift monitoring framework is the focus -- not the embedding architecture.
 
 The drift monitoring framework, statistical methods (MMD, KS, cosine distance, PSI), threshold selection, alerting infrastructure, and mitigation strategies demonstrated here apply equally to any embedding type. In production, the same monitoring pipeline would wrap entity embeddings, autoencoder latent vectors, or GNN node embeddings, with the same drift detection mathematics.
 
